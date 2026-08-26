@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from math import ceil
@@ -18,6 +17,8 @@ from .contracts import (
     AgentSource,
     AgentView,
 )
+from .policy import DEFAULT_EXECUTION_POLICY, ExecutionPolicyError
+from .settings import LLMSettings
 
 
 class PlanningError(ValueError):
@@ -26,6 +27,14 @@ class PlanningError(ValueError):
 
 class PlanningPolicyError(PlanningError):
     pass
+
+
+def validate_planning_policy(message: str) -> None:
+    """Reject platform side effects before any deterministic or LLM planning."""
+    try:
+        DEFAULT_EXECUTION_POLICY.validate_message(message)
+    except ExecutionPolicyError as exc:
+        raise PlanningPolicyError(str(exc)) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,15 +54,14 @@ class ConversationalPlanner:
         ollama_model: str | None = None,
         timeout_seconds: float = 12.0,
     ) -> None:
+        settings = LLMSettings.from_env()
         self._ollama_base_url = (
             ollama_base_url
-            or os.getenv("SOCIAL_AGENT_OLLAMA_BASE_URL")
-            or "http://127.0.0.1:11434/v1"
+            or settings.base_url
         ).rstrip("/")
         self._ollama_model = (
             ollama_model
-            or os.getenv("SOCIAL_AGENT_OLLAMA_MODEL")
-            or "qwen3.5:9b"
+            or settings.model
         )
         self._timeout_seconds = timeout_seconds
 
@@ -66,6 +74,7 @@ class ConversationalPlanner:
         cleaned = " ".join(message.split()).strip()
         if not cleaned:
             raise PlanningError("请输入希望 Agent 执行的任务。")
+        validate_planning_policy(cleaned)
         try:
             draft = _deterministic_draft(cleaned, session, previous_plan)
         except PlanningPolicyError:
@@ -126,12 +135,6 @@ def _deterministic_draft(
     session: SelectedSession,
     previous_plan: AgentPlan | None,
 ) -> dict[str, Any]:
-    forbidden = ("点赞", "评论", "关注", "转发", "发布", "私信", "自动登录")
-    if any(word in message for word in forbidden):
-        raise PlanningPolicyError(
-            "当前 Agent 只允许浏览和下载，不执行点赞、评论、关注、发布或自动登录。"
-        )
-
     platform = _detect_platform(message) or AgentPlatform(session.platform)
     source = AgentSource.SEARCH
     start_url = _first_https_url(message)

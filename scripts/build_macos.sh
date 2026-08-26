@@ -5,6 +5,12 @@ project_dir="$(cd "$(dirname "$0")/.." && pwd)"
 tools_dir="$(cd "$project_dir/../tools" && pwd)"
 cd "$project_dir"
 
+"$project_dir/scripts/install_harness.sh"
+node_bin="${SOCIAL_AGENT_NODE:-/opt/homebrew/opt/node@24/bin/node}"
+if [[ ! -x "$node_bin" ]]; then
+  node_bin="$(command -v node)"
+fi
+
 python_bin="$project_dir/.venv/bin/python"
 if [[ ! -x "$python_bin" ]]; then
   echo "Missing .venv. Create it and install social_content_crawler plus this package first." >&2
@@ -20,6 +26,8 @@ fi
   --paths src \
   --paths "$tools_dir/social_content_crawler/src" \
   --paths "$tools_dir/media_content_analyzer/src" \
+  --add-data "$project_dir/harness:harness" \
+  --add-binary "$node_bin:." \
   --collect-all cv2 \
   --collect-all imageio_ffmpeg \
   --collect-all playwright \

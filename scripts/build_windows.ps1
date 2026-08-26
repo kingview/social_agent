@@ -4,6 +4,9 @@ $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pat
 $ToolsDir = Join-Path (Split-Path -Parent $ProjectDir) "tools"
 Set-Location $ProjectDir
 
+& (Join-Path $ProjectDir "scripts\install_harness.ps1")
+$NodeExe = if ($env:SOCIAL_AGENT_NODE) { $env:SOCIAL_AGENT_NODE } else { (Get-Command node.exe).Source }
+
 $PythonExe = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 if (-not (Test-Path $PythonExe)) {
   throw "Missing .venv. Install social_content_crawler plus this package first."
@@ -17,6 +20,8 @@ if (-not (Test-Path $PythonExe)) {
   --paths src `
   --paths "$ToolsDir\social_content_crawler\src" `
   --paths "$ToolsDir\media_content_analyzer\src" `
+  --add-data "$ProjectDir\harness;harness" `
+  --add-binary "$NodeExe;." `
   --collect-all cv2 `
   --collect-all imageio_ffmpeg `
   --collect-all playwright `

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from math import ceil
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
@@ -43,6 +44,7 @@ class AgentPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    mode: Literal["fixed"] = "fixed"
     objective: str = Field(min_length=1, max_length=2_000)
     platform: AgentPlatform
     session_ref: str = Field(
@@ -129,6 +131,20 @@ class AgentProgress(BaseModel):
     message: str
 
 
+class DynamicAgentPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["dynamic_harness"] = "dynamic_harness"
+    objective: str = Field(min_length=1, max_length=2_000)
+    platform: Literal["douyin", "xiaohongshu", "x"]
+    session_ref: str = Field(pattern=r"^sess_(?:douyin|xhs|x)_[A-Za-z0-9_-]{20,80}$")
+    summary: str = Field(min_length=1, max_length=2_000)
+    steps: list[str] = Field(min_length=1, max_length=12)
+    risk_notes: list[str] = Field(default_factory=list, max_length=12)
+    max_tool_calls: int = Field(default=20, ge=1, le=20)
+    requires_confirmation: bool = True
+
+
 class AgentRunResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -143,3 +159,28 @@ class AgentRunResult(BaseModel):
     tool_calls_used: int = Field(ge=0)
     cancelled: bool = False
     warnings: list[str] = Field(default_factory=list)
+
+
+class AgentExecutionResult(BaseModel):
+    """Runtime-neutral result consumed by desktop and service frontends."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runtime: Literal["deterministic", "deepseek_harness"]
+    plan: AgentPlan | DynamicAgentPlan
+    summary: str
+    tool_calls: list[str] = Field(default_factory=list)
+    tool_calls_used: int = Field(default=0, ge=0)
+    output_directories: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    metrics: dict[str, int | float | str | bool] = Field(default_factory=dict)
+    cancelled: bool = False
+    finish_reason: str | None = None
+
+
+class RuntimeHealth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    runtime: Literal["deterministic", "deepseek_harness"]
+    available: bool
+    detail: str

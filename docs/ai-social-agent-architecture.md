@@ -1,7 +1,7 @@
 # 多平台 AI 社媒运营 Agent 技术架构
 
-> 版本：v0.6
-> 日期：2026-08-21
+> 版本：v0.8
+> 日期：2026-08-27
 > 适用平台：X、Facebook、Telegram 及后续扩展平台
 
 ## 1. 文档目标
@@ -45,7 +45,7 @@
 3. **只在非确定性节点调用 LLM**：内容理解、语义判断、回复生成和动态规划使用模型。
 4. **业务流程与模型供应商解耦**：通过 Model Gateway 适配不同厂商和自部署模型。
 5. **Tool 定义单一来源**：内部 Tool Registry 是唯一权威定义，再生成各框架适配器。
-6. **外层与内层编排分离**：Temporal 管理业务生命周期，LangGraph 管理一次动态 Agent 推理过程。
+6. **外层与内层编排分离**：Temporal 管理服务端业务生命周期；桌面 MVP 使用 DeepSeek Harness，服务端可通过同一 Adapter 替换或组合 LangGraph。
 7. **所有状态可审计**：记录 Prompt、模型、Tool、输入输出、审批和外部响应。
 8. **风险策略版本化**：生产策略只能经过评测、审批和发布流程更新。
 
@@ -238,7 +238,7 @@ Platform / Model / Storage Implementations
 flowchart TD
     A["业务请求 / 平台事件 / 定时监控"] --> B{"业务类型"}
     B -->|"固化流程"| C["Temporal Workflow"]
-    B -->|"动态任务"| D["LangGraph Agent"]
+    B -->|"动态任务"| D["Agent Runtime Adapter<br/>DeepSeek Harness / LangGraph"]
 
     C --> E["Tool Registry"]
     D --> E
@@ -276,7 +276,7 @@ flowchart TD
 | 后端 API | Python FastAPI | 业务 API、租户权限、服务聚合 |
 | 数据模型 | Pydantic、JSON Schema | Tool、Workflow、Agent 输出契约 |
 | 固化流程编排 | Temporal Python SDK | 调度、重试、超时、补偿、长流程恢复 |
-| 动态 Agent 编排 | LangGraph | 分支、循环、状态、动态 Tool 路径 |
+| 动态 Agent 编排 | 桌面 DeepSeek Harness；服务端 LangGraph 可选 | 分支、循环、状态、动态 Tool 路径 |
 | 多模型网关 | LiteLLM Proxy + 自定义 Adapter | 路由、Fallback、限流、成本和模型能力管理 |
 | AI 组件库 | LangChain，可选 | Tool、Retriever、RAG 等局部适配 |
 | 政策引擎 | Open Policy Agent + Risk Service | 权限、业务规则、风险决策 |
@@ -299,7 +299,7 @@ flowchart TD
 | Web API | FastAPI | Starlette | 核对依赖版本许可证 |
 | 数据契约 | Pydantic、JSON Schema | Protobuf | 契约与生成代码需要版本化 |
 | 长流程 | Temporal Community | 自研状态机仅限简单任务 | Server、SDK 和依赖分别核对 |
-| 动态 Agent | LangGraph | 自研有限状态图 | 仅作为 Agent 内层，不侵入领域协议 |
+| 动态 Agent | DeepSeek Harness（桌面 MVP） | LangGraph、自研有限状态图 | Harness 当前为 Developer Preview，必须锁版本并通过 Adapter 隔离；运行状态不得侵入领域协议 |
 | 模型网关 | LiteLLM Community | 自研 Provider Adapter | Enterprise 目录和插件另行核对 |
 | 本地 LLM/VLM 推理 | Linux GPU 使用 vLLM；桌面使用 Ollama | SGLang、llama.cpp、MLX/vLLM-Metal | 推理框架与模型权重分别核对；Windows 的 vLLM 生产部署使用 WSL2 或远程 Linux Worker |
 | 文本向量模型 | Sentence Transformers | 自建 Embedding Worker | 框架为 Apache 2.0；checkpoint 单独核对 |
@@ -363,7 +363,7 @@ flowchart TD
 - [Open Policy Agent](https://github.com/open-policy-agent/opa)
 - [Langfuse Self-hosting](https://langfuse.com/docs/deployment/self-host)
 
-## 6. LiteLLM、LangChain、LangGraph 和 Temporal 的职责
+## 6. Model Gateway、DeepSeek Harness、LangGraph 和 Temporal 的职责
 
 ### 6.1 LiteLLM
 
@@ -390,7 +390,40 @@ LangChain 作为可替换的 AI 应用组件库，可用于：
 
 LangChain 类型不得进入核心领域模型、数据库结构或执行协议。
 
-### 6.3 LangGraph
+### 6.3 DeepSeek Harness
+
+当前 macOS/Windows 桌面 Agent 使用锁定版本 `deepseek-harness 0.1.1-rc.2` 作为动态执行内核：
+
+- Node.js 要求 `22.19+`，当前开发与打包基线为 Node.js 24。
+- Python GUI 通过 stdio JSON-RPC 启动独立 Harness Runtime，不把 Node 类型暴露给业务层。
+- 规划 Cordis 不加载任何 Tool；只有用户确认计划后才启动执行 Cordis。
+- 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills、工作区上下文和平台写操作。
+- MCP 适配器暴露 `browse_posts`、`download_media`、`analyze_content`、`process_watermark`、`generate_post_copy`。
+- 本地模型经 OpenAI-compatible 路由连接 Ollama `qwen3.5:9b`；生产环境仍通过 Model Gateway 路由。
+- Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
+- 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
+
+Harness 是可替换的 `AgentRuntimeAdapter`，其 JSON-RPC event、MCP 名称和内部 session 不能成为跨服务领域协议。升级 Release Candidate 前必须运行契约测试、Tool 白名单测试、无工具规划测试和真实模型冒烟测试。
+
+当前代码中的 Adapter 结构为：
+
+```text
+RuntimeRouter
+├── DeterministicAgentRuntime
+│   └── SocialOperationsAgent
+└── DeepSeekHarnessRuntime
+    └── DeepSeekHarnessBackend → JSON-RPC → Cordis → MCP
+
+共享：
+├── ExecutionPolicy
+├── LLMSettings
+├── AgentProgress
+└── AgentExecutionResult
+```
+
+Qt Worker 只调用 `RuntimeRouter.propose/execute/cancel`，不导入具体 Tool 或创建 Harness Backend。`ExecutionPolicy` 是浏览数量、批次、总下载量与 Tool 次数的应用层权威限制；Prompt 和 Tool Schema 只能进一步收紧，不能放宽。`LLMSettings` 使用 `SOCIAL_AGENT_LLM_*` 通用变量，并兼容旧 `SOCIAL_AGENT_OLLAMA_*` 变量，因而可以无代码切换 Ollama、LiteLLM、vLLM 或 SGLang。
+
+### 6.4 LangGraph
 
 LangGraph 负责动态 Agent 内部的：
 
@@ -401,7 +434,9 @@ LangGraph 负责动态 Agent 内部的：
 - Human-in-the-loop。
 - 动态 Tool 路径规划。
 
-### 6.4 Temporal
+LangGraph 保留为服务端复杂图、多 Agent 复核和已有生态集成的可选 Runtime；它与 Harness 共用 Tool Registry、MCP/JSON Schema、审批和审计边界，不允许在业务层同时硬编码两套 Tool。
+
+### 6.5 Temporal
 
 Temporal 负责完整业务生命周期：
 
@@ -419,9 +454,10 @@ Temporal Workflow
 ├── 获取平台事件
 ├── 调用确定性 Tool
 ├── 调用 Agent Activity
-│   └── LangGraph
-│       ├── LangChain Tool / Retriever（可选）
-│       └── LiteLLM → 多种模型
+│   └── AgentRuntimeAdapter
+│       ├── DeepSeek Harness + MCP（桌面/轻量 Worker）
+│       ├── LangGraph + LangChain（服务端可选）
+│       └── Model Gateway → 多种模型
 ├── 执行政策检查
 ├── 等待人工审批
 ├── 调用平台连接器
@@ -437,6 +473,7 @@ Tool Registry 是所有 Tool 定义的唯一权威来源，同一份定义可以
 - LLM Function Calling Schema。
 - LangChain `StructuredTool`。
 - LangGraph ToolNode。
+- DeepSeek Harness MCP Tool。
 - MCP Tool Adapter。
 - Temporal Activity 调用。
 - 管理后台参数表单。
@@ -495,7 +532,7 @@ tools/
 | `media.process_watermark` | `1.4.0` | 视频 artifact、检测/去除模式、修复质量、时序一致性、置信度、自动动态检测、人工框选/跟踪参数和授权确认 | 水印区域、类型、置信度、实际修复质量/方法、原始 artifact 与可选衍生 artifact | `media.analyze`、`media.transform` |
 | `media.generate_post_copy` | `1.0.0` | `ContentAnalysisOutput`、平台、语气、长度和生成数量 | `GeneratePostCopyOutput` | `media.generate_copy` |
 
-`media.generate_post_copy` 不直接发布内容。它只生成结构化候选，继续发布时必须进入平台写操作的 Policy、审批和审计链。桌面 GUI 与 Agent 调用共用同一 Pydantic 契约、Ollama/OpenAI-compatible 模型适配器和审计日志。生成过程把分析结果和用户补充要求都视为不可信数据，避免 Prompt 注入；文案不得编造分析证据之外的事实。
+`media.generate_post_copy` 不直接发布内容。它只生成结构化候选，继续发布时必须进入平台写操作的 Policy、审批和审计链。桌面 GUI 与 Agent 调用共用同一 Pydantic 契约、OpenAI-compatible 模型适配器和审计日志。生成过程把分析结果和用户补充要求都视为不可信数据，避免 Prompt 注入；文案不得编造分析证据之外的事实。
 
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
@@ -503,7 +540,7 @@ tools/
 
 `social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成构成可审计的组合工作流。
 
-本地 `Social Agent` Client 提供会话式任务入口。自然语言先转换成版本化 `AgentPlan`，平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行；计划必须在 GUI 中人工确认后才调用 Tool。当前固定路径使用有限状态 Runtime，不引入完整 LangGraph。未来出现“下载后逐帖分析、按观察继续搜索、失败重规划、多模型复核”等动态循环时，在保持 AgentPlan、AgentRunResult 和 Tool 契约不变的前提下引入 LangGraph。
+本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“下载后分析、按观察继续搜索、筛选、总结、生成文案”等非固定路径进入 DeepSeek Harness。规划阶段使用无 Tool Cordis，确认后使用仅含五个本地 MCP Tool 的执行 Cordis；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
 
 `media.process_watermark` 与下载器保持分离。下载器始终保存原始 artifact；水印 Tool 用 OpenCV 抽帧检测画面任意位置的持久静态叠加层，并从每个采样帧提取文字/Logo 候选，通过归一化边缘描述子跨帧聚类：同一外观在至少 35% 采样帧中重复、位置变化且相似度达到高置信阈值时，自动判定为动态水印。轨迹不要求从首个采样帧开始，周期滚动水印与固定水印可在同一视频中同时返回。仅在任务明确要求、用户确认授权且候选达到置信度和面积阈值时才生成带 `derived_from_sha256` 的衍生 artifact。默认的本机时序修复不再擦除整个粗检测框：它从多帧持久边缘生成细粒度笔画 mask，以动态候选首次可靠出现的时间点建立模板并向视频前后双向跟踪；局部匹配降级时执行全画面重新定位，以处理滚动水印的循环跳转。随后逐帧 Telea inpaint，并使用稠密光流把上一帧修复结果对齐后仅在 mask 内低比例融合，以降低闪烁和矩形模糊。快速模式保留 FFmpeg `delogo`/矩形 inpaint 作为低成本路径。低置信度、间歇出现或复杂形变候选可在 Watermark Studio 人工框选首帧区域后跟踪，并强制标记为需要人工检查。Social Agent 可将其作为每个下载批次后的可选步骤，原文件禁止覆盖。
 
@@ -1545,7 +1582,8 @@ MVP 可以共享一个 PostgreSQL 集群，但必须使用独立 Schema、Reposi
 
 ### 阶段三：动态 Agent
 
-- LangGraph Agent Runtime。
+- DeepSeek Harness 桌面 Runtime 与 JSON-RPC/MCP Adapter。
+- LangGraph 服务端 Runtime（按复杂图与多 Agent 需求选配）。
 - 动态 Tool 规划。
 - 多模型复核。
 - Agent 成本和迭代预算。
@@ -1568,7 +1606,10 @@ MVP 可以共享一个 PostgreSQL 集群，但必须使用独立 Schema、Reposi
 | 问题 | 决策 |
 |---|---|
 | 固定流程使用什么 | Temporal |
-| 动态 Agent 使用什么 | LangGraph |
+| 动态 Agent 使用什么 | 桌面 MVP 使用 DeepSeek Harness；服务端通过 Adapter 选配 LangGraph |
+| Runtime 如何解耦 GUI | `RuntimeRouter` + `AgentRuntime`，统一输出 `AgentExecutionResult` |
+| 模型端点如何配置 | `SOCIAL_AGENT_LLM_*`；兼容旧 `SOCIAL_AGENT_OLLAMA_*` |
+| Harness 如何引入 | npm 锁版本安装；修改内核时才维护独立 Fork/Submodule |
 | 是否必须使用 LangChain | 否，只作为可替换组件库 |
 | 多模型如何接入 | LiteLLM Proxy + Model Gateway |
 | Tool 在哪里定义 | 自研 Tool Registry，Pydantic/JSON Schema 为权威协议 |
@@ -1599,9 +1640,10 @@ Next.js
 + Pydantic Tool Registry
 + LiteLLM Proxy
 + Ollama（Mac/Windows 客户端）或 vLLM（Linux GPU Worker）
++ DeepSeek Harness + MCP（桌面动态任务）
 + Open Policy Agent
 + Postgres Outbox / Inbox
 + OpenTelemetry
 ```
 
-第一版暂不引入完整 LangChain 和 LangGraph。等实际出现动态规划、循环分析和多 Agent 复核需求后，再将 LangGraph 加入 `agent-service`。LangChain 只在某个 Tool、Retriever 或 RAG 组件能明显降低实现成本时局部采用。
+第一版桌面端已引入锁版本 DeepSeek Harness，但不引入完整 LangChain 和 LangGraph。服务端出现复杂图、多 Agent 复核或 Harness 暂不覆盖的持久化需求后，可在 `AgentRuntimeAdapter` 后加入 LangGraph。LangChain 只在某个 Tool、Retriever 或 RAG 组件能明显降低实现成本时局部采用。

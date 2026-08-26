@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
+import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QStandardPaths, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,9 +26,9 @@ from PySide6.QtWidgets import (
 from social_content_crawler.desktop import SessionManagerDialog
 from social_content_crawler.sessions import SessionRecord, SessionRegistry, default_session_registry_path
 
-from .contracts import AgentPlan, AgentProgress, AgentRunResult
-from .planner import ConversationalPlanner, PlanningError, SelectedSession
-from .runtime import SocialOperationsAgent
+from .agent_runtime import RuntimePlan, RuntimeRouter
+from .contracts import AgentExecutionResult, AgentPlan, AgentProgress, DynamicAgentPlan
+from .planner import PlanningError, SelectedSession
 
 
 APP_NAME = "Social Agent"
@@ -49,24 +49,36 @@ class PlanWorker(QThread):
         message: str,
         session: SelectedSession,
         previous_plan: AgentPlan | None,
+        conversation_id: str,
+        registry_path: Path,
+        output_root: Path,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._message = message
         self._session = session
         self._previous_plan = previous_plan
+        self._router = RuntimeRouter(
+            registry_path=registry_path,
+            output_root=output_root,
+            conversation_id=conversation_id,
+        )
 
     def run(self) -> None:
         try:
-            plan = ConversationalPlanner().create_plan(
+            plan = self._router.propose(
                 self._message,
                 self._session,
                 self._previous_plan,
             )
         except PlanningError as exc:
             self.failed.emit(str(exc))
-        except Exception:
-            self.failed.emit("无法生成执行计划，请检查本地模型或换一种更明确的表达。")
+        except Exception as exc:
+            detail = str(exc).strip()
+            self.failed.emit(
+                detail
+                or "无法生成执行计划，请确认 Harness、Node 24 与配置的模型服务正在运行。"
+            )
         else:
             self.succeeded.emit(plan)
 
@@ -79,36 +91,47 @@ class ExecutionWorker(QThread):
     def __init__(
         self,
         *,
-        plan: AgentPlan,
+        plan: RuntimePlan,
         registry_path: Path,
         output_root: Path,
+        conversation_id: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._plan = plan
-        self._registry_path = registry_path
-        self._output_root = output_root
         self._cancel_requested = False
+        self._router = RuntimeRouter(
+            registry_path=registry_path,
+            output_root=output_root,
+            conversation_id=conversation_id,
+        )
 
     def cancel_after_current_batch(self) -> None:
         self._cancel_requested = True
+        self._router.cancel()
 
     def run(self) -> None:
         try:
-            registry = SessionRegistry(self._registry_path)
-            agent = SocialOperationsAgent.local(
-                session_registry=registry,
-                output_root=self._output_root,
-            )
-            result = asyncio.run(
-                agent.execute_plan(
-                    self._plan,
-                    progress=self.progress_changed.emit,
-                    should_cancel=lambda: self._cancel_requested,
-                    authorization_confirmed=True,
-                )
+            result = self._router.execute(
+                self._plan,
+                progress=self.progress_changed.emit,
             )
         except Exception as exc:
+            if self._cancel_requested:
+                self.succeeded.emit(
+                    AgentExecutionResult(
+                        runtime=(
+                            "deepseek_harness"
+                            if isinstance(self._plan, DynamicAgentPlan)
+                            else "deterministic"
+                        ),
+                        plan=self._plan,
+                        summary="任务已由用户停止。",
+                        cancelled=True,
+                        finish_reason="cancelled",
+                    )
+                )
+                return
             message = str(exc).strip() or "Agent 执行失败。"
             self.failed.emit(message)
         else:
@@ -126,11 +149,12 @@ class MainWindow(QMainWindow):
         self._registry_path = (registry_path or default_session_registry_path()).expanduser().resolve()
         self._registry = SessionRegistry(self._registry_path)
         self._output_root = (output_root or default_output_root()).expanduser().resolve()
+        self._conversation_id = f"conversation-{uuid.uuid4().hex}"
         self._plan_worker: PlanWorker | None = None
         self._execution_worker: ExecutionWorker | None = None
-        self._pending_plan: AgentPlan | None = None
+        self._pending_plan: RuntimePlan | None = None
         self._last_plan: AgentPlan | None = None
-        self._last_result: AgentRunResult | None = None
+        self._last_result: AgentExecutionResult | None = None
 
         self.setWindowTitle("Social Agent · 社媒任务助手")
         self.resize(1_020, 760)
@@ -152,7 +176,7 @@ class MainWindow(QMainWindow):
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Social Agent")
         title.setObjectName("title")
-        subtitle = QLabel("用一句话编排帖子浏览与下载；计划确认后才执行。")
+        subtitle = QLabel("固定 Workflow + DeepSeek Harness 动态编排；计划确认后才执行。")
         subtitle.setObjectName("subtitle")
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
@@ -218,7 +242,7 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout()
         hint = QLabel("只读浏览与本地下载 · 不自动登录 · 不执行平台写操作")
         hint.setObjectName("hint")
-        self.cancel_button = QPushButton("当前批次后停止")
+        self.cancel_button = QPushButton("停止任务")
         self.cancel_button.setObjectName("secondaryButton")
         self.cancel_button.clicked.connect(self.cancel_execution)
         self.cancel_button.hide()
@@ -238,7 +262,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(input_frame)
 
         self._append_agent(
-            "请选择一个已经在比特浏览器中手动登录的会话，然后告诉我需要搜索、浏览或下载什么。"
+            "请选择一个已经在比特浏览器中手动登录的会话，然后描述任务。"
+            "常规搜索下载使用固定 Workflow；分析、筛选、总结和文案等复杂任务使用 DeepSeek Harness。"
         )
 
     def request_plan(self) -> None:
@@ -261,6 +286,9 @@ class MainWindow(QMainWindow):
             message=message,
             session=session,
             previous_plan=self._last_plan,
+            conversation_id=self._conversation_id,
+            registry_path=self._registry_path,
+            output_root=self._output_root,
             parent=self,
         )
         worker.succeeded.connect(self._plan_succeeded)
@@ -269,10 +297,20 @@ class MainWindow(QMainWindow):
         self._plan_worker = worker
         worker.start()
 
-    def _plan_succeeded(self, plan: AgentPlan) -> None:
+    def _plan_succeeded(self, plan: RuntimePlan) -> None:
         self._pending_plan = plan
-        self._last_plan = plan
         self.execute_button.setEnabled(True)
+        if isinstance(plan, DynamicAgentPlan):
+            steps = "\n".join(f"{index}. {step}" for index, step in enumerate(plan.steps, 1))
+            risks = ""
+            if plan.risk_notes:
+                risks = "\n提醒：" + "；".join(plan.risk_notes)
+            self._append_agent(
+                f"Harness 动态计划已生成：{plan.summary}\n{steps}{risks}\n"
+                "点击“确认并执行计划”后，Harness 才能调用白名单 MCP Tools。"
+            )
+            return
+        self._last_plan = plan
         if plan.remove_watermark:
             action = "浏览、下载并在检测到高置信度静态水印时生成去水印副本"
         else:
@@ -310,6 +348,7 @@ class MainWindow(QMainWindow):
             plan=plan,
             registry_path=self._registry_path,
             output_root=self._output_root,
+            conversation_id=self._conversation_id,
             parent=self,
         )
         worker.progress_changed.connect(self._execution_progress)
@@ -323,7 +362,7 @@ class MainWindow(QMainWindow):
         if self._execution_worker is not None:
             self._execution_worker.cancel_after_current_batch()
             self.cancel_button.setEnabled(False)
-            self.progress_label.setText("已请求停止，将在当前下载批次结束后停止…")
+            self.progress_label.setText("已请求停止；固定下载将在当前批次后停止…")
 
     def _execution_progress(self, event: AgentProgress) -> None:
         percent = int(event.completed / max(event.total, 1) * 100)
@@ -331,22 +370,13 @@ class MainWindow(QMainWindow):
         self.progress_value.setText(f"{percent}%")
         self.progress_label.setText(event.message)
 
-    def _execution_succeeded(self, result: AgentRunResult) -> None:
+    def _execution_succeeded(self, result: AgentExecutionResult) -> None:
         self._last_result = result
-        state = "已停止" if result.cancelled else "执行完成"
-        details = (
-            f"{state}：发现 {len(result.discovered_urls)} 条，下载 {result.downloaded_items} 条，"
-            f"生成 {result.artifact_count} 个文件，使用 {result.tool_calls_used} 次 Tool 调用。"
-        )
-        if result.plan.remove_watermark:
-            details += (
-                f"\n检测到水印 {result.watermark_detected_count} 个，"
-                f"生成去水印副本 {result.watermark_processed_count} 个。"
-            )
+        details = result.summary
+        if result.tool_calls:
+            details += "\nTool：" + "、".join(result.tool_calls)
         if result.output_directories:
             details += f"\n保存目录：{result.output_directories[0]}"
-        if result.watermark_output_directories:
-            details += f"\n去水印副本目录：{result.watermark_output_directories[0]}"
         if result.warnings:
             details += "\n提醒：" + "；".join(result.warnings)
         self._append_agent(details)
@@ -397,17 +427,20 @@ class MainWindow(QMainWindow):
         self._pending_plan = None
         self._last_plan = None
         self._last_result = None
+        self._conversation_id = f"conversation-{uuid.uuid4().hex}"
         self.execute_button.setEnabled(False)
         self.progress_frame.hide()
         self._append_agent("新会话已开始。请选择执行会话并描述任务。")
 
     def open_last_output(self) -> None:
-        if self._last_result and self._last_result.output_directories:
+        if self._last_result is not None and self._last_result.output_directories:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_result.output_directories[0]))
 
     def _set_planning(self, planning: bool) -> None:
         self.plan_button.setEnabled(not planning)
         self.session_combo.setEnabled(not planning)
+        self.manage_sessions_button.setEnabled(not planning)
+        self.message_input.setEnabled(not planning)
         self.plan_button.setText("正在生成计划…" if planning else "生成计划  →")
 
     def _append_user(self, message: str) -> None:
