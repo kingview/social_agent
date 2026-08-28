@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from .contracts import AgentProgress, DynamicAgentPlan
 from .harness_client import HarnessError, HarnessJsonRpcClient
 from .planner import SelectedSession
+from .plugins import default_plugin_root
 from .policy import DEFAULT_EXECUTION_POLICY, ExecutionPolicy
 from .settings import LLMSettings
 
@@ -195,6 +196,7 @@ class DeepSeekHarnessBackend:
             "SOCIAL_AGENT_SESSION_REGISTRY": str(self.registry_path),
             "SOCIAL_AGENT_OUTPUT_ROOT": str(self.output_root),
             "SOCIAL_AGENT_STATE_ROOT": str(self.state_root),
+            "SOCIAL_AGENT_PLUGIN_ROOT": str(default_plugin_root()),
             "SOCIAL_AGENT_PYTHONPATH": _pythonpath(self.project_root),
         }
         client = HarnessJsonRpcClient(
@@ -224,6 +226,12 @@ def requires_dynamic_harness(message: str) -> bool:
         "研究",
         "根据结果",
         "继续搜索",
+        "打开页面",
+        "点击",
+        "输入",
+        "翻页",
+        "滚动",
+        "按下",
         "生成文案",
         "生成选题",
         "报告",
@@ -235,7 +243,8 @@ def _planning_persona() -> str:
     return """你是 Social Agent 的只读任务规划器。你没有任何工具，也不能执行任务。
 把用户目标规划为固定或动态步骤，只输出一个 JSON 对象，禁止 Markdown：
 {"summary":"简洁计划说明","steps":["步骤1","步骤2"],"risk_notes":["提醒"]}
-允许的能力只有：浏览抖音/小红书/X、下载公开或用户已授权会话可见的帖子媒体、
+允许的能力只有：在已授权的比特浏览器会话中打开页面、观察、点击搜索/导航控件、
+输入非敏感搜索词、按键、滚动或翻页；浏览抖音/小红书/X、下载会话可见的帖子媒体、
 分析本地媒体、检测并生成去水印副本、生成本地文案草稿。禁止登录、发布、点赞、
 评论、关注、私信、转发、修改代理或索取 Cookie/密码/验证码。所有执行都要用户确认。"""
 
@@ -299,9 +308,13 @@ def _validated_dynamic_plan(
 def _execution_persona() -> str:
     return """你是 Social Agent 的动态执行内核。用户已经在桌面端确认本次整体计划。
 你只能调用 mcp__social__ 命名空间下的工具，不能调用或假设任何其他能力。
+标准能力可以直接调用具名工具；新增插件能力先调用 list_plugin_tools 查看，再通过
+call_plugin_tool 调用清单中明确声明的工具。插件未安装或未启用时不得假设其可用。
 严格使用任务中提供的 selected_session_ref，不得索取或输出 Cookie、密码、验证码、
 代理或指纹信息。平台不匹配时停止并说明。浏览最多100条；下载工具每次最多20个URL，
 超过时分批调用，总下载预算默认5000MB。只处理下载结果返回的本地文件路径。
+需要通用页面操作时，先调用 browser_operate(action="observe") 获取 element_ref；
+只允许搜索、浏览和翻页，不得输入密码/验证码或点击发布、互动、交易、删除类控件。
 去水印必须保留原文件。文案只生成本地草稿，绝不发布。根据工具结果可以调整搜索、
 分析、筛选和后续步骤。完成后用中文汇总实际调用、结果、输出目录、警告和未完成项。"""
 

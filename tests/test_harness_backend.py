@@ -23,6 +23,7 @@ def test_dynamic_plan_contract_binds_platform_and_opaque_session() -> None:
 
 def test_dynamic_marker_routes_complex_tasks_to_harness() -> None:
     assert requires_dynamic_harness("搜索 Web3 并分析内容、生成文案")
+    assert requires_dynamic_harness("打开抖音，点击搜索框输入 Web3 后翻页")
     assert not requires_dynamic_harness("搜索 Web3 并下载前20个帖子")
 
 

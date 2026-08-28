@@ -5,8 +5,6 @@ import threading
 from pathlib import Path
 from typing import Callable, Protocol, TypeAlias
 
-from social_content_crawler.sessions import SessionRegistry
-
 from .contracts import (
     AgentExecutionResult,
     AgentPlan,
@@ -97,9 +95,8 @@ class DeterministicAgentRuntime:
             raise TypeError("deterministic runtime requires AgentPlan")
         self.policy.validate_plan(plan)
         self._cancelled.clear()
-        registry = SessionRegistry(self.registry_path)
         agent = SocialOperationsAgent.local(
-            session_registry=registry,
+            session_registry_path=self.registry_path,
             output_root=self.output_root,
         )
         result = asyncio.run(

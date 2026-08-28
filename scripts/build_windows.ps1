@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$ToolsDir = Join-Path (Split-Path -Parent $ProjectDir) "tools"
 Set-Location $ProjectDir
 
 & (Join-Path $ProjectDir "scripts\install_harness.ps1")
@@ -18,23 +17,11 @@ if (-not (Test-Path $PythonExe)) {
   --windowed `
   --name SocialAgent `
   --paths src `
-  --paths "$ToolsDir\social_content_crawler\src" `
-  --paths "$ToolsDir\media_content_analyzer\src" `
   --add-data "$ProjectDir\harness;harness" `
   --add-binary "$NodeExe;." `
-  --collect-all cv2 `
-  --collect-all imageio_ffmpeg `
-  --collect-all playwright `
-  --collect-all yt_dlp `
+  --exclude-module PIL `
+  --exclude-module numpy `
   --collect-submodules social_ops_agent `
-  --collect-submodules social_content_crawler `
-  --collect-submodules media_content_analyzer `
   desktop_main.py
-
-$AnalyzerDir = Join-Path $ToolsDir "media_content_analyzer"
-& "$AnalyzerDir\scripts\build_video_repair_worker_windows.ps1"
-$WorkerTarget = Join-Path $ProjectDir "dist\SocialAgent\video-repair-worker"
-New-Item -ItemType Directory -Path $WorkerTarget -Force | Out-Null
-Copy-Item -Path "$AnalyzerDir\build\video-repair-worker-dist\VideoRepairWorker\*" -Destination $WorkerTarget -Recurse -Force
 
 Write-Host "Built: $ProjectDir\dist\SocialAgent\SocialAgent.exe"

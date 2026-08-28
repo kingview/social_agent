@@ -35,12 +35,17 @@ def test_desktop_has_conversation_and_confirmation_controls(tmp_path: Path) -> N
         encoding="utf-8",
     )
     app = QApplication.instance() or QApplication([])
-    window = MainWindow(registry_path=registry, output_root=tmp_path / "downloads")
+    window = MainWindow(
+        registry_path=registry,
+        output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+    )
 
     assert "社媒任务助手" in window.windowTitle()
     assert window.session_combo.itemText(0).startswith("抖音")
     assert window.plan_button.text().startswith("生成计划")
     assert window.execute_button.text() == "确认并执行计划"
     assert not window.execute_button.isEnabled()
+    assert window.plugins_button.text() == "Tool 插件 · 0"
     window.close()
     app.processEvents()

@@ -398,7 +398,7 @@ LangChain 类型不得进入核心领域模型、数据库结构或执行协议�
 - Python GUI 通过 stdio JSON-RPC 启动独立 Harness Runtime，不把 Node 类型暴露给业务层。
 - 规划 Cordis 不加载任何 Tool；只有用户确认计划后才启动执行 Cordis。
 - 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills、工作区上下文和平台写操作。
-- MCP 适配器暴露 `browse_posts`、`download_media`、`analyze_content`、`process_watermark`、`generate_post_copy`。
+- MCP 插件桥保留六个标准具名 Tool，并暴露 `list_plugin_tools` 与 `call_plugin_tool` 发现和调用后续插件能力。
 - 本地模型经 OpenAI-compatible 路由连接 Ollama `qwen3.5:9b`；生产环境仍通过 Model Gateway 路由。
 - Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
 - 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
@@ -526,8 +526,9 @@ tools/
 
 | Tool | 版本 | 输入 | 输出 | 权限 |
 |---|---:|---|---|---|
+| `browser.operate` | `1.0.0` | 平台专属 `session_ref`、单个受限动作、可选元素引用/定位条件和等待参数 | 当前 URL、标题、正文摘要、可交互元素引用与警告 | `social_content.read`、`browser_session.use`、`browser_ui.operate` |
 | `social.browse_posts` | `1.0.0` | 抖音、小红书或 X 的查询条件、分类、限制和平台专属 `session_ref` | 结构化帖子 URL、作者、正文、时间、媒体类型与互动量 | `social_content.read`、`browser_session.use` |
-| `social.download_media` | `1.6.0` | HTTPS 帖子 URL、下载限制、可选 `session_ref` | 帖子元数据与本地 artifact 清单 | `social_content.read`、`media.download` |
+| `social.download_media` | `1.7.0` | HTTPS 帖子 URL、下载限制、可选 `session_ref` | 帖子元数据、本地 artifact 清单与非敏感网络路由标识 | `social_content.read`、`media.download` |
 | `media.analyze_content` | `1.1.1` | 下载器 artifact 清单、帖子正文和分析选项 | `ContentAnalysisOutput` | `media.analyze` |
 | `media.process_watermark` | `1.4.0` | 视频 artifact、检测/去除模式、修复质量、时序一致性、置信度、自动动态检测、人工框选/跟踪参数和授权确认 | 水印区域、类型、置信度、实际修复质量/方法、原始 artifact 与可选衍生 artifact | `media.analyze`、`media.transform` |
 | `media.generate_post_copy` | `1.0.0` | `ContentAnalysisOutput`、平台、语气、长度和生成数量 | `GeneratePostCopyOutput` | `media.generate_copy` |
@@ -536,11 +537,13 @@ tools/
 
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
-`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书或 X 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。单次登录态下载时，Executor 经比特浏览器只读本地接口读取对应平台域 Cookie，生成 `0600` 临时 Cookie 文件，并在成功或失败后删除。会话的平台范围必须与 URL 匹配，登录失效返回稳定错误码并转人工重新登录。当前实现不自动登录、不修改代理或指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
+`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书或 X 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。单次登录态下载时，Executor 先打开对应窗口以应用当前网络配置，再经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的 HTTP/HTTPS/SOCKS5 代理；Cookie 写入 `0600` 临时文件，代理仅以瞬时内存值注入 `yt-dlp`、图片和抖音后备下载链路。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时使用本机网络并输出 `direct`；两种结果均不包含代理主机、端口、账号或密码。成功或失败后删除临时 Cookie。会话的平台范围必须与 URL 匹配，登录失效返回稳定错误码并转人工重新登录。当前实现不自动登录、不修改或轮换代理和指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
 
 `social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成构成可审计的组合工作流。
 
-本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“下载后分析、按观察继续搜索、筛选、总结、生成文案”等非固定路径进入 DeepSeek Harness。规划阶段使用无 Tool Cordis，确认后使用仅含五个本地 MCP Tool 的执行 Cordis；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
+`browser.operate` 补足无法预先固化的平台页面流程。比特浏览器官方 Local API 负责 Profile 生命周期：健康检查、列表/详情、创建/修改、打开/关闭、代理和指纹配置等；页面内 DOM 点击、输入和滚动不属于 Local API 端点。Tool 因此只调用 `/browser/open` 获取回环地址上的 WebSocket/HTTP CDP 端点，再由 Playwright 操作该 Profile 中的可见标签页。支持 `observe`、`navigate`、`click`、`input`、`press`、`scroll`、`back`、`forward`、`reload` 和 `wait`；`observe` 返回短期 `element_ref`，供后续动作复用。导航仅接受公开 HTTPS 地址；禁止密码、验证码、密钥和文件输入，并在点击前拦截发布、互动、交易、账户变更及删除类控件。每个 `session_ref` 串行操作，目标标签页和元素引用仅保留在本机进程内，页面正文仍按不可信输入处理。当前版本不调用 `/browser/add`、`/browser/modify`、`/browser/close`、`/browser/delete` 或代理批量修改接口，Profile、代理和指纹继续由用户在比特浏览器中预配置。
+
+本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“逐步点击/输入/翻页、下载后分析、按观察继续搜索、筛选、总结、生成文案”等非固定路径进入 DeepSeek Harness。规划阶段使用无 Tool Cordis，确认后使用仅含已安装、已启用插件能力的 MCP Tool Bridge；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
 
 `media.process_watermark` 与下载器保持分离。下载器始终保存原始 artifact；水印 Tool 用 OpenCV 抽帧检测画面任意位置的持久静态叠加层，并从每个采样帧提取文字/Logo 候选，通过归一化边缘描述子跨帧聚类：同一外观在至少 35% 采样帧中重复、位置变化且相似度达到高置信阈值时，自动判定为动态水印。轨迹不要求从首个采样帧开始，周期滚动水印与固定水印可在同一视频中同时返回。仅在任务明确要求、用户确认授权且候选达到置信度和面积阈值时才生成带 `derived_from_sha256` 的衍生 artifact。默认的本机时序修复不再擦除整个粗检测框：它从多帧持久边缘生成细粒度笔画 mask，以动态候选首次可靠出现的时间点建立模板并向视频前后双向跟踪；局部匹配降级时执行全画面重新定位，以处理滚动水印的循环跳转。随后逐帧 Telea inpaint，并使用稠密光流把上一帧修复结果对齐后仅在 mask 内低比例融合，以降低闪烁和矩形模糊。快速模式保留 FFmpeg `delogo`/矩形 inpaint 作为低成本路径。低置信度、间歇出现或复杂形变候选可在 Watermark Studio 人工框选首帧区域后跟踪，并强制标记为需要人工检查。Social Agent 可将其作为每个下载批次后的可选步骤，原文件禁止覆盖。
 
@@ -589,6 +592,33 @@ class ToolSpec(BaseModel):
 - 账号控制类 Tool 必须经过权限和政策检查。
 - 所有外部操作必须携带幂等键。
 - Tool 版本、输入、输出、调用人、模型和 Trace ID 必须进入审计日志。
+
+### 7.5 桌面 Tool 插件安装模型
+
+macOS/Windows 桌面端采用“轻量 Agent Core + 用户级 Tool 插件”部署，不再把所有 Tool 依赖复制进 `SocialAgent.app`：
+
+```text
+SocialAgent.app
+├── Qt GUI / RuntimeRouter / ExecutionPolicy
+├── DeepSeek Harness + Node
+├── PluginManager
+└── MCP Plugin Bridge → 常驻 Plugin Host（后台事件循环）
+                          │
+                          ├── com.socialagent.social-content/.venv → crawler MCP
+                          └── com.socialagent.media-content/.venv  → analyzer MCP
+
+用户数据目录
+├── plugins/<plugin-id>/.venv       # 独立版本视图和进程边界
+└── runtimes/package-store-v1       # 相同依赖文件的内容寻址硬链接存储
+```
+
+插件包扩展名为 `.socialtool`，本质是受约束的 ZIP，根目录必须包含 `plugin.json`，Python wheel 放在 `packages/`。清单固定声明插件 ID、语义版本、平台、发布者、MCP module、独立 GUI module、Tool 名称白名单和权限；Tool 的 description、input schema 与 output schema 只以运行时 MCP `list_tools` 为准，不在清单重复维护。macOS/Linux 使用 `build_plugins.sh`，Windows 使用 `build_plugins.ps1`；构建器把全部 wheel 的 SHA-256 写入清单，并在 `locks/` 生成当前 OS/架构/Python ABI 专用、包含所有传递依赖及 SHA-256 的 pip 锁。正式发布流水线必须分别在 macOS arm64/x64、Windows x64 和 Linux x64 构建对应锁。安装器校验 wheel 文件集合与摘要，优先用匹配 ABI 的锁和 `pip --require-hashes` 安装；旧包没有锁时才进入兼容安装路径。安装器同时拒绝路径穿越，单包解压上限为 4 GB，先在临时目录创建隔离环境，成功后再原子替换当前版本，升级失败恢复旧版本。
+
+安装位置：macOS 为 `~/Library/Application Support/SocialAgent/plugins`，Windows 为 `%LOCALAPPDATA%\SocialAgent\plugins`。Agent App 不修改自身 Bundle，卸载插件也不删除下载结果、分析结果或会话注册表。每个插件仍使用独立解释器和 stdio MCP 进程，但进程由 Core 内的 Plugin Host 按需启动并跨 Tool 调用复用；同一插件内请求串行进入其 MCP session，避免不安全的并发访问浏览器或模型。禁用、升级、卸载以及版本变化会关闭旧进程。启动握手会严格比较 MCP 实际 Tool 集合与清单白名单，不匹配时拒绝使用。
+
+插件虚拟环境保持版本隔离；安装后对 `site-packages` 的普通不可变文件计算 SHA-256，并以同卷硬链接接入 `runtimes/package-store-v1`。这样依赖冲突仍由各插件自己的 venv 解决，而 Qt、MCP、Pydantic 等字节完全相同的文件只保存一次；平台不支持硬链接时安全退化为普通独立文件。卸载或升级后只清理没有插件引用的内容。Core 的六个标准 Tool 只做稳定兼容转发，未知新能力通过默认返回实时 schema 的 `list_plugin_tools` 发现、`call_plugin_tool` 调用。同名 Tool 由多个启用插件提供时拒绝执行，避免不确定路由。
+
+插件代码具有本机执行权限，因此生产分发必须在现有结构上增加发布者签名、归档 SHA-256、可信源、撤销列表和升级回滚策略。当前本地开发版只接受用户主动选择的安装包。Python 依赖安装需要 3.11+ 引导解释器，可用 `SOCIAL_AGENT_PLUGIN_PYTHON` 指定；大型模型应首次使用时下载到共享模型缓存，不放回 Agent App。插件能力禁用或缺失时，规划器和执行器必须明确报告，不能静默回退为未授权实现。
 
 ## 8. 固化业务工作流
 
@@ -1613,6 +1643,7 @@ MVP 可以共享一个 PostgreSQL 集群，但必须使用独立 Schema、Reposi
 | 是否必须使用 LangChain | 否，只作为可替换组件库 |
 | 多模型如何接入 | LiteLLM Proxy + Model Gateway |
 | Tool 在哪里定义 | 自研 Tool Registry，Pydantic/JSON Schema 为权威协议 |
+| 桌面 Tool 如何部署 | `.socialtool` 用户级插件；独立 Python/MCP 进程，不写入 Agent App |
 | LLM 是否直接执行外部动作 | 否，只生成 ProposedAction |
 | 外部操作如何执行 | Policy Engine + Approval + Execution Gateway |
 | 账号如何选择 | 确定性约束求解和负载分配 |

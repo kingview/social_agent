@@ -4,25 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-ops-agent"
-version = "0.3.0"
+version = "0.6.0"
 description = "A local conversational agent that orchestrates social browsing and download tools"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "media-content-analyzer>=0.5,<1",
     "mcp>=1.26,<2",
     "pydantic>=2.10,<3",
-    "pyside6==6.11.2",
-    "social-content-crawler>=0.4,<1",
+    "pyside6-essentials==6.11.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
 build = ["pyinstaller>=6.16"]
+legacy-tools = [
+    "media-content-analyzer>=0.10,<1",
+    "social-content-crawler>=0.6,<1",
+]
 
 [project.scripts]
 social-ops-agent = "social_ops_agent.desktop:main"
 social-agent-mcp = "social_ops_agent.mcp_server:main"
+social-agent-plugin = "social_ops_agent.plugin_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,7 +5,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, QThread, QUrl, Signal
+from PySide6.QtCore import QStandardPaths, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from social_content_crawler.desktop import SessionManagerDialog
-from social_content_crawler.sessions import SessionRecord, SessionRegistry, default_session_registry_path
-
 from .agent_runtime import RuntimePlan, RuntimeRouter
 from .contracts import AgentExecutionResult, AgentPlan, AgentProgress, DynamicAgentPlan
+from .plugin_desktop import PluginManagerDialog
+from .plugins import PluginError, PluginInvoker, PluginManager
 from .planner import PlanningError, SelectedSession
+from .session_store import SessionRecord, SessionStore, default_session_registry_path
+from .settings import LLMSettings
 
 
 APP_NAME = "Social Agent"
@@ -144,23 +145,29 @@ class MainWindow(QMainWindow):
         *,
         registry_path: Path | None = None,
         output_root: Path | None = None,
+        plugin_root: Path | None = None,
     ) -> None:
         super().__init__()
         self._registry_path = (registry_path or default_session_registry_path()).expanduser().resolve()
-        self._registry = SessionRegistry(self._registry_path)
+        self._registry = SessionStore(self._registry_path)
         self._output_root = (output_root or default_output_root()).expanduser().resolve()
+        self._plugin_manager = PluginManager(plugin_root)
         self._conversation_id = f"conversation-{uuid.uuid4().hex}"
         self._plan_worker: PlanWorker | None = None
         self._execution_worker: ExecutionWorker | None = None
         self._pending_plan: RuntimePlan | None = None
         self._last_plan: AgentPlan | None = None
         self._last_result: AgentExecutionResult | None = None
+        self._session_manager_process = None
+        self._session_manager_timer = QTimer(self)
+        self._session_manager_timer.setInterval(500)
+        self._session_manager_timer.timeout.connect(self._poll_session_manager)
 
         self.setWindowTitle("Social Agent · 社媒任务助手")
         self.resize(1_020, 760)
         self.setMinimumSize(780, 620)
         self._build_ui()
-        self._refresh_sessions()
+        self._refresh_plugin_state()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -186,6 +193,10 @@ class MainWindow(QMainWindow):
         self.new_chat_button = QPushButton("新会话")
         self.new_chat_button.setObjectName("secondaryButton")
         self.new_chat_button.clicked.connect(self.new_conversation)
+        self.plugins_button = QPushButton("Tool 插件")
+        self.plugins_button.setObjectName("secondaryButton")
+        self.plugins_button.clicked.connect(self.manage_plugins)
+        header.addWidget(self.plugins_button)
         header.addWidget(self.new_chat_button)
         layout.addLayout(header)
 
@@ -263,7 +274,7 @@ class MainWindow(QMainWindow):
 
         self._append_agent(
             "请选择一个已经在比特浏览器中手动登录的会话，然后描述任务。"
-            "常规搜索下载使用固定 Workflow；分析、筛选、总结和文案等复杂任务使用 DeepSeek Harness。"
+            "常规搜索下载使用固定 Workflow；逐步点击/输入/翻页以及分析、筛选、总结和文案等复杂任务使用 DeepSeek Harness。"
         )
 
     def request_plan(self) -> None:
@@ -340,6 +351,7 @@ class MainWindow(QMainWindow):
         self.plan_button.setEnabled(False)
         self.session_combo.setEnabled(False)
         self.manage_sessions_button.setEnabled(False)
+        self.plugins_button.setEnabled(False)
         self.cancel_button.show()
         self.progress_frame.show()
         self.progress_bar.setValue(0)
@@ -389,13 +401,52 @@ class MainWindow(QMainWindow):
         self.plan_button.setEnabled(True)
         self.session_combo.setEnabled(True)
         self.manage_sessions_button.setEnabled(True)
+        self.plugins_button.setEnabled(True)
         self.cancel_button.hide()
         self.cancel_button.setEnabled(True)
 
     def manage_sessions(self) -> None:
-        dialog = SessionManagerDialog(self._registry, self)
-        dialog.sessions_changed.connect(self._refresh_sessions)
+        try:
+            settings = LLMSettings.from_env()
+            invoker = PluginInvoker(
+                self._plugin_manager,
+                session_registry=self._registry_path,
+                output_root=self._output_root,
+                state_root=self._output_root / ".social-agent-state",
+                llm_base_url=settings.base_url,
+                llm_model=settings.model,
+                llm_api_key=settings.api_key,
+            )
+            self._session_manager_process = invoker.launch_gui(
+                "com.socialagent.social-content",
+                ["--manage-sessions-only"],
+            )
+        except PluginError as exc:
+            QMessageBox.information(
+                self,
+                "需要社媒浏览与下载插件",
+                f"{exc}\n\n请先点击顶部“Tool 插件”安装社媒浏览与下载插件。",
+            )
+            return
+        self._session_manager_timer.start()
+
+    def _poll_session_manager(self) -> None:
+        process = self._session_manager_process
+        if process is not None and process.poll() is None:
+            return
+        self._session_manager_timer.stop()
+        self._session_manager_process = None
+        self._refresh_sessions()
+
+    def manage_plugins(self) -> None:
+        dialog = PluginManagerDialog(self._plugin_manager, self)
+        dialog.plugins_changed.connect(self._refresh_plugin_state)
         dialog.exec()
+        self._refresh_plugin_state()
+
+    def _refresh_plugin_state(self) -> None:
+        enabled = self._plugin_manager.list(enabled_only=True)
+        self.plugins_button.setText(f"Tool 插件 · {len(enabled)}")
         self._refresh_sessions()
 
     def _refresh_sessions(self) -> None:
@@ -440,6 +491,7 @@ class MainWindow(QMainWindow):
         self.plan_button.setEnabled(not planning)
         self.session_combo.setEnabled(not planning)
         self.manage_sessions_button.setEnabled(not planning)
+        self.plugins_button.setEnabled(not planning)
         self.message_input.setEnabled(not planning)
         self.plan_button.setText("正在生成计划…" if planning else "生成计划  →")
 

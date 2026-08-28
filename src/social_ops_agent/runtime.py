@@ -6,22 +6,90 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from social_content_crawler import (
-    BrowsePostsInput,
-    DownloadInput,
-    InMemoryAuditSink,
-    LocalRateLimiter,
-    PublicHttpsUrlPolicy,
-    SessionRegistry,
-    SocialMediaDownloadTool,
-    SocialPostBrowseTool,
-    SocialPostBrowserBackend,
-    YtDlpBackend,
-)
-from social_content_crawler.platforms import default_allowed_domains
-from social_content_crawler.ports import ToolContext
+from pydantic import BaseModel, ConfigDict
 
 from .contracts import AgentPlan, AgentProgress, AgentRunResult
+from .plugins import PluginInvoker, PluginManager
+from .settings import LLMSettings
+
+
+class ToolContext(BaseModel):
+    tenant_id: str
+    trace_id: str
+    agent_run_id: str
+    actor_type: str
+    actor_id: str
+
+
+class BrowsePostsInput(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    platform: str
+    session_ref: str
+    source: str
+    view: str
+    query: str | None = None
+    user_key: str | None = None
+    start_url: Any = None
+    max_items: int
+    max_scrolls: int
+
+
+class DownloadInput(BaseModel):
+    urls: list[str]
+    media_format: str
+    max_items: int
+    max_total_size_mb: int
+    session_ref: str
+
+
+class ArtifactRef(BaseModel):
+    path: str
+    size_bytes: int
+    sha256: str
+    media_type: str | None = None
+
+
+class ProcessWatermarkInput(BaseModel):
+    artifacts: list[ArtifactRef]
+    mode: str
+    authorization_confirmed: bool
+    minimum_confidence: float
+
+
+class _PluginValue:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+        for key, value in payload.items():
+            setattr(self, key, _plugin_value(value))
+
+    def model_dump(self) -> dict[str, Any]:
+        return self._payload
+
+
+def _plugin_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _PluginValue(value)
+    if isinstance(value, list):
+        return [_plugin_value(item) for item in value]
+    return value
+
+
+class PluginExecutableTool:
+    def __init__(self, invoker: PluginInvoker, tool_name: str) -> None:
+        self.invoker = invoker
+        self.tool_name = tool_name
+
+    async def execute(self, request: BaseModel, context: ToolContext) -> Any:
+        del context
+        payload = request.model_dump(mode="json", exclude_none=True)
+        if self.tool_name == "process_watermark":
+            payload = {
+                "file_paths": [item["path"] for item in payload.pop("artifacts")],
+                "minimum_confidence": payload["minimum_confidence"],
+                "repair_quality": "auto",
+            }
+        return _plugin_value(await self.invoker.call(self.tool_name, payload))
 
 
 class ExecutableTool(Protocol):
@@ -50,40 +118,34 @@ class SocialOperationsAgent:
     def local(
         cls,
         *,
-        session_registry: SessionRegistry,
+        session_registry_path: Path,
         output_root: Path,
         download_progress: Callable[[dict[str, Any]], None] | None = None,
         state_root: Path | None = None,
+        plugin_manager: PluginManager | None = None,
     ) -> SocialOperationsAgent:
-        audit = InMemoryAuditSink()
-        limiter = LocalRateLimiter()
-        browse_tool = SocialPostBrowseTool(
-            backend=SocialPostBrowserBackend(session_registry=session_registry),
-            audit_sink=audit,
-            rate_limiter=limiter,
-        )
-        download_tool = SocialMediaDownloadTool(
-            backend=YtDlpBackend(
-                session_registry=session_registry,
-                progress_callback=download_progress,
-            ),
-            audit_sink=audit,
-            rate_limiter=limiter,
-            url_policy=PublicHttpsUrlPolicy(),
+        del download_progress
+        settings = LLMSettings.from_env()
+        manager = plugin_manager or PluginManager()
+        invoker = PluginInvoker(
+            manager,
+            session_registry=session_registry_path,
             output_root=output_root,
-            allowed_domains=default_allowed_domains(),
+            state_root=state_root or output_root / ".social-agent-state",
+            llm_base_url=settings.base_url,
+            llm_model=settings.model,
+            llm_api_key=settings.api_key,
         )
-        watermark_tool = None
-        try:
-            from media_content_analyzer import build_local_watermark_tool
-
-            watermark_tool = build_local_watermark_tool(
-                allowed_media_root=output_root,
-                state_root=state_root or output_root / ".social-agent-state",
-                output_root=output_root / "watermark-processed",
+        browse_tool = PluginExecutableTool(invoker, "browse_posts")
+        download_tool = PluginExecutableTool(invoker, "download_media")
+        watermark_tool = (
+            PluginExecutableTool(invoker, "process_watermark")
+            if any(
+                "process_watermark" in {tool.name for tool in record.manifest.tools}
+                for record in manager.list(enabled_only=True)
             )
-        except ImportError:
-            pass
+            else None
+        )
         return cls(
             browse_tool=browse_tool,
             download_tool=download_tool,
@@ -192,8 +254,6 @@ class SocialOperationsAgent:
             if output.output_directory:
                 output_directories.append(output.output_directory)
             if plan.remove_watermark and output.artifacts:
-                from media_content_analyzer import ArtifactRef, ProcessWatermarkInput
-
                 video_artifacts = [
                     ArtifactRef.model_validate(artifact.model_dump())
                     for artifact in output.artifacts
