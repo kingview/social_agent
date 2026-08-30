@@ -45,7 +45,7 @@ class FakeRuntime:
         self.error = error
         self.proposals = 0
 
-    def propose(self, message, session, previous_plan=None):
+    def propose(self, message, session, previous_plan=None, **_kwargs):
         self.proposals += 1
         if self.error is not None:
             raise self.error
@@ -88,8 +88,37 @@ def test_router_falls_back_to_harness_when_fixed_parser_cannot_plan(tmp_path: Pa
 
 def test_policy_rejection_happens_before_runtime_selection(tmp_path: Path) -> None:
     router = _router(tmp_path)
-    with pytest.raises(PlanningPolicyError, match="不执行"):
+    with pytest.raises(PlanningPolicyError, match="不支持其他平台写操作"):
         router.propose("分析完成后自动发布", SESSION)
+
+
+def test_explicit_x_publication_routes_to_harness(tmp_path: Path) -> None:
+    session = SelectedSession(
+        session_ref="sess_x_abcdefghijklmnopqrstuvwx",
+        platform="x",
+        profile_name="X test",
+    )
+    router = _router(tmp_path)
+    fixed = FakeRuntime(plan=_fixed_plan())
+    harness = FakeRuntime(
+        plan=DynamicAgentPlan(
+            objective="生成文案并发布到X",
+            platform="x",
+            session_ref=session.session_ref,
+            summary="生成并发布一条 X 帖子",
+            steps=["生成文案", "发布到 X"],
+            write_actions=["publish_x"],
+        )
+    )
+    router._deterministic = lambda: fixed  # type: ignore[method-assign]
+    router._harness = lambda: harness  # type: ignore[method-assign]
+
+    plan = router.propose("生成文案并发布到X", session)
+
+    assert isinstance(plan, DynamicAgentPlan)
+    assert plan.write_actions == ["publish_x"]
+    assert harness.proposals == 1
+    assert fixed.proposals == 0
 
 
 def test_cancel_before_worker_mounts_runtime_is_not_lost(tmp_path: Path) -> None:

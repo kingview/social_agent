@@ -1,4 +1,5 @@
 from .contracts import (
+    AgentAttachment,
     AgentExecutionResult,
     AgentMediaFormat,
     AgentPlan,
@@ -7,6 +8,7 @@ from .contracts import (
     AgentRunResult,
     AgentSource,
     AgentView,
+    AttachmentModality,
     DynamicAgentPlan,
     RuntimeHealth,
 )
@@ -31,6 +33,7 @@ from .settings import LLMSettings
 
 __all__ = [
     "AgentExecutionResult",
+    "AgentAttachment",
     "AgentMediaFormat",
     "AgentPlan",
     "AgentPlatform",
@@ -38,6 +41,7 @@ __all__ = [
     "AgentRunResult",
     "AgentSource",
     "AgentView",
+    "AttachmentModality",
     "AgentRuntime",
     "ConversationalPlanner",
     "DeepSeekHarnessBackend",

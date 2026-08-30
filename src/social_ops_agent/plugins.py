@@ -66,6 +66,7 @@ class PluginManifest(BaseModel):
             "read-agent-output",
             "write-agent-output",
             "local-model",
+            "social-content-write",
         ]
     ] = Field(default_factory=list)
     package_sha256: dict[str, str] = Field(default_factory=dict)
@@ -252,7 +253,7 @@ class PluginManager:
         wheels = sorted((root / "packages").glob("*.whl"))
         if not wheels:
             raise PluginError("plugin bundle contains no Python wheel in packages/")
-        bootstrap_python = _plugin_bootstrap_python()
+        bootstrap_python = _plugin_bootstrap_python(root / "locks")
         subprocess.run([str(bootstrap_python), "-m", "venv", str(root / ".venv")], check=True)
         python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         lock = root / "locks" / dependency_lock_filename(python)
@@ -416,11 +417,33 @@ class PluginInvoker:
         if not module:
             raise PluginError(f"plugin has no standalone GUI: {plugin_id}")
         self._require_runtime(record)
-        return subprocess.Popen(
-            [str(record.python), "-m", module, *(extra_args or [])],
-            cwd=record.root,
-            env={**os.environ, **self._environment()},
-        )
+        environment = self._environment()
+        # A frozen Qt host sets these paths to the libraries inside its own app
+        # bundle.  Passing them to a plugin venv makes the child load two
+        # different Qt builds and macOS aborts while initializing Cocoa.
+        for name in (
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QT_QPA_PLATFORM",
+            "QML2_IMPORT_PATH",
+            "QML_IMPORT_PATH",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+        ):
+            environment.pop(name, None)
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            return subprocess.Popen(
+                [str(record.python), "-m", module, *(extra_args or [])],
+                cwd=record.root,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise PluginError(f"无法启动插件界面：{exc}") from exc
 
     def _environment(self) -> dict[str, str]:
         return {
@@ -495,8 +518,9 @@ def build_dependency_lock(
     manifest_path: Path,
     wheels: list[Path],
     output_directory: Path,
+    resolver_python: Path | None = None,
 ) -> Path:
-    """Resolve a hash-pinned lock for the current platform and Python ABI."""
+    """Resolve a hash-pinned lock for a selected platform-compatible Python ABI."""
     manifest = PluginManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     if not wheels:
         raise PluginError("at least one wheel is required")
@@ -506,11 +530,16 @@ def build_dependency_lock(
         requirements[0] += "[" + ",".join(manifest.runtime.install_extras) + "]"
     output_directory = output_directory.expanduser().resolve()
     output_directory.mkdir(parents=True, exist_ok=True)
+    resolver = (resolver_python or Path(sys.executable)).expanduser().resolve()
+    if not resolver.is_file():
+        raise PluginError(f"dependency resolver Python does not exist: {resolver}")
+    if not _is_supported_plugin_python(resolver):
+        raise PluginError(f"plugin dependency resolver requires Python 3.11+: {resolver}")
     with tempfile.TemporaryDirectory(prefix="social-agent-lock-") as temporary:
         report = Path(temporary) / "report.json"
         subprocess.run(
             [
-                sys.executable,
+                str(resolver),
                 "-m",
                 "pip",
                 "install",
@@ -526,7 +555,7 @@ def build_dependency_lock(
         )
         payload = json.loads(report.read_text(encoding="utf-8"))
     lines = [
-        f"# Social Agent dependency lock: {current_platform_tag()} / {python_abi_tag(Path(sys.executable))}",
+        f"# Social Agent dependency lock: {current_platform_tag()} / {python_abi_tag(resolver)}",
         "# Generated from pip's resolver; do not edit by hand.",
     ]
     resolved: list[tuple[str, str, str]] = []
@@ -543,7 +572,7 @@ def build_dependency_lock(
         resolved.append((normalized_name, version, str(digest).lower()))
     for name, version, digest in sorted(resolved):
         lines.append(f"{name}=={version} --hash=sha256:{digest}")
-    output = output_directory / dependency_lock_filename(Path(sys.executable))
+    output = output_directory / dependency_lock_filename(resolver)
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output
 
@@ -586,25 +615,63 @@ def dependency_lock_filename(python: Path) -> str:
     return f"requirements-{current_platform_tag()}-{python_abi_tag(python)}.lock"
 
 
-def _plugin_bootstrap_python() -> Path:
+def _is_supported_plugin_python(candidate: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [str(candidate), "-c", "import sys; print(int(sys.version_info >= (3, 11)))"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return result.stdout.strip() == "1"
+
+
+def _plugin_bootstrap_python(lock_directory: Path | None = None) -> Path:
     configured = os.getenv("SOCIAL_AGENT_PLUGIN_PYTHON", "").strip()
     if configured:
         candidate = Path(configured).expanduser().resolve()
-        if candidate.is_file():
+        if candidate.is_file() and _is_supported_plugin_python(candidate):
             return candidate
-        raise PluginError(f"SOCIAL_AGENT_PLUGIN_PYTHON does not exist: {candidate}")
-    if not getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve()
-    names = ["python3.exe", "python.exe"] if os.name == "nt" else ["python3"]
-    candidates = [
+        raise PluginError(
+            "SOCIAL_AGENT_PLUGIN_PYTHON must point to an existing Python 3.11+ "
+            f"interpreter: {candidate}"
+        )
+    names = (
+        ["python3.12.exe", "python3.13.exe", "python3.11.exe", "python3.exe", "python.exe"]
+        if os.name == "nt"
+        else ["python3.12", "python3.13", "python3.11", "python3"]
+    )
+    raw_candidates = [
         *(Path(value) for value in (shutil.which(name) for name in names) if value),
+        Path(sys.executable),
+        Path("/opt/homebrew/bin/python3.12"),
+        Path("/opt/homebrew/bin/python3.13"),
+        Path("/opt/homebrew/bin/python3.11"),
         Path("/opt/homebrew/bin/python3"),
+        Path("/usr/local/bin/python3.12"),
+        Path("/usr/local/bin/python3.13"),
+        Path("/usr/local/bin/python3.11"),
         Path("/usr/local/bin/python3"),
         Path("/usr/bin/python3"),
     ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for raw_candidate in raw_candidates:
+        if not raw_candidate.is_file():
+            continue
+        candidate = raw_candidate.resolve()
+        if candidate in seen or not _is_supported_plugin_python(candidate):
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    if lock_directory is not None:
+        for candidate in candidates:
+            if (lock_directory / dependency_lock_filename(candidate)).is_file():
+                return candidate
+    if candidates:
+        return candidates[0]
     raise PluginError(
         "未找到用于创建隔离插件环境的 Python 3.11+。"
         "请安装 Python，或通过 SOCIAL_AGENT_PLUGIN_PYTHON 指定解释器。"

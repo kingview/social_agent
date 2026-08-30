@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -16,6 +17,8 @@ from social_ops_agent.plugins import (
     PluginManager,
     PluginManifest,
     build_plugin_bundle,
+    current_platform_tag,
+    python_abi_tag,
 )
 
 
@@ -163,3 +166,74 @@ if __name__ == '__main__':
     finally:
         host.close()
     assert first["pid"] == second["pid"]
+
+
+def test_plugin_gui_does_not_inherit_frozen_host_qt_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_root = tmp_path / "plugins" / MANIFEST["id"]
+    python = plugin_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"runtime")
+    manifest = {
+        **MANIFEST,
+        "runtime": {
+            "module": "test_tool.mcp",
+            "gui_module": "test_tool.desktop",
+            "install_extras": [],
+        },
+    }
+    (plugin_root / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (plugin_root / "state.json").write_text(
+        json.dumps({"enabled": True, "installed_at": "now"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("QT_PLUGIN_PATH", "/frozen-app/Qt/plugins")
+    monkeypatch.setenv("QT_QPA_PLATFORM_PLUGIN_PATH", "/frozen-app/Qt/plugins/platforms")
+    monkeypatch.setenv("PYTHONPATH", "/frozen-app")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pass
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("social_ops_agent.plugins.subprocess.Popen", fake_popen)
+    invoker = PluginInvoker(
+        PluginManager(tmp_path / "plugins"),
+        session_registry=tmp_path / "sessions.json",
+        output_root=tmp_path / "output",
+        state_root=tmp_path / "state",
+        llm_base_url="http://127.0.0.1:11434/v1",
+        llm_model="test",
+        llm_api_key="test",
+    )
+
+    invoker.launch_gui(MANIFEST["id"], ["--manage-sessions-only"])
+
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert "QT_PLUGIN_PATH" not in environment
+    assert "QT_QPA_PLATFORM_PLUGIN_PATH" not in environment
+    assert "PYTHONPATH" not in environment
+    assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert captured["stderr"] is subprocess.PIPE
+
+
+def test_plugin_bootstrap_prefers_interpreter_matching_bundled_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from social_ops_agent import plugins
+
+    current = Path(sys.executable).resolve()
+    lock_directory = tmp_path / "locks"
+    lock_directory.mkdir()
+    lock = lock_directory / (
+        f"requirements-{current_platform_tag()}-{python_abi_tag(current)}.lock"
+    )
+    lock.write_text("# test lock\n", encoding="utf-8")
+    monkeypatch.delenv("SOCIAL_AGENT_PLUGIN_PYTHON", raising=False)
+
+    assert plugins._plugin_bootstrap_python(lock_directory) == current

@@ -123,18 +123,19 @@ class SocialOperationsAgent:
         download_progress: Callable[[dict[str, Any]], None] | None = None,
         state_root: Path | None = None,
         plugin_manager: PluginManager | None = None,
+        settings: LLMSettings | None = None,
     ) -> SocialOperationsAgent:
         del download_progress
-        settings = LLMSettings.from_env()
+        active_settings = settings or LLMSettings.from_env()
         manager = plugin_manager or PluginManager()
         invoker = PluginInvoker(
             manager,
             session_registry=session_registry_path,
             output_root=output_root,
             state_root=state_root or output_root / ".social-agent-state",
-            llm_base_url=settings.base_url,
-            llm_model=settings.model,
-            llm_api_key=settings.api_key,
+            llm_base_url=active_settings.base_url,
+            llm_model=active_settings.model,
+            llm_api_key=active_settings.api_key,
         )
         browse_tool = PluginExecutableTool(invoker, "browse_posts")
         download_tool = PluginExecutableTool(invoker, "download_media")

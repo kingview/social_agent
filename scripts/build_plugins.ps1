@@ -6,8 +6,15 @@ $ErrorActionPreference = "Stop"
 $ProjectDirectory = Split-Path -Parent $PSScriptRoot
 $ToolsDirectory = (Resolve-Path (Join-Path $ProjectDirectory "..\tools")).Path
 $Python = Join-Path $ProjectDirectory ".venv\Scripts\python.exe"
+$PluginPython = $env:SOCIAL_AGENT_PLUGIN_PYTHON
 if (-not (Test-Path $Python)) {
     throw "Missing $Python"
+}
+if (-not $PluginPython) {
+    $PluginPython = $Python
+}
+if (-not (Test-Path $PluginPython)) {
+    throw "Missing compatible plugin Python: $PluginPython"
 }
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $ProjectDirectory "dist\plugins"
@@ -33,6 +40,7 @@ function Build-ToolPlugin {
     $Lock = (& $Python -m social_ops_agent.plugin_cli lock `
         --manifest $Manifest `
         --wheel $Wheel.FullName `
+        --python $PluginPython `
         --output-directory $WheelDirectory | Select-Object -Last 1).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $Lock) { throw "Failed to lock $OutputName dependencies" }
     & $Python -m social_ops_agent.plugin_cli bundle `

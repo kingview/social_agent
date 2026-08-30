@@ -1,8 +1,15 @@
 # Planning-only DeepSeek Harness composition. It deliberately loads no Tools:
 # a planning turn cannot browse, download, read files, or mutate external state.
 
+- id: attachments
+  name: '@deepseek-ai/dsh-attachment-local'
+  config:
+    dshHome: !!js process.env.DSH_HOME
+    maxImagesPerMessage: 8
+    maxMessageImageBytes: 83886080
+
 - id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  name: './social-sdk-jsonrpc-server.mjs'
   config:
     maxTokensAsSuccess: false
 
@@ -10,8 +17,8 @@
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
     providers:
-      local-openai-compatible:
-        displayName: Local OpenAI-compatible Model
+      social-openai-compatible:
+        displayName: Configured OpenAI-compatible Model
         apiKeyEnv: SOCIAL_AGENT_LLM_API_KEY
         api: openai-completions
         baseURL: !!js process.env.SOCIAL_AGENT_LLM_BASE_URL ?? 'http://127.0.0.1:11434/v1'
@@ -20,9 +27,10 @@
           maxTokensField: max_tokens
         models:
           - id: !!js process.env.SOCIAL_AGENT_LLM_MODEL ?? 'qwen3.5:9b'
-            name: Local Social Planner
+            name: Configured Social Planner
             contextWindow: 32768
             maxTokens: 4096
+            input: [text, image]
 
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'

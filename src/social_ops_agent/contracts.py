@@ -36,6 +36,24 @@ class AgentMediaFormat(StrEnum):
     AUDIO = "audio"
 
 
+class AttachmentModality(StrEnum):
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+
+
+class AgentAttachment(BaseModel):
+    """One user-selected file staged into the Agent-owned input directory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4_096)
+    display_name: str = Field(min_length=1, max_length=500)
+    media_type: str = Field(min_length=1, max_length=200)
+    modality: AttachmentModality
+    size_bytes: int = Field(ge=1, le=1_073_741_824)
+
+
 class AgentPlan(BaseModel):
     """Validated plan produced from a conversation turn.
 
@@ -136,13 +154,35 @@ class DynamicAgentPlan(BaseModel):
 
     mode: Literal["dynamic_harness"] = "dynamic_harness"
     objective: str = Field(min_length=1, max_length=2_000)
-    platform: Literal["douyin", "xiaohongshu", "x"]
-    session_ref: str = Field(pattern=r"^sess_(?:douyin|xhs|x)_[A-Za-z0-9_-]{20,80}$")
+    platform: Literal["douyin", "xiaohongshu", "x"] | None = None
+    session_ref: str | None = Field(
+        default=None,
+        pattern=r"^sess_(?:douyin|xhs|x)_[A-Za-z0-9_-]{20,80}$",
+    )
     summary: str = Field(min_length=1, max_length=2_000)
     steps: list[str] = Field(min_length=1, max_length=12)
-    risk_notes: list[str] = Field(default_factory=list, max_length=12)
+    attachments: list[AgentAttachment] = Field(default_factory=list, max_length=8)
+    media_context: str | None = Field(default=None, max_length=80_000)
+    write_actions: list[Literal["publish_x"]] = Field(default_factory=list, max_length=1)
     max_tool_calls: int = Field(default=20, ge=1, le=20)
     requires_confirmation: bool = True
+
+    @model_validator(mode="after")
+    def validate_optional_browser_session(self) -> DynamicAgentPlan:
+        if (self.platform is None) != (self.session_ref is None):
+            raise ValueError("platform and session_ref must either both be present or both be absent")
+        if self.platform is not None and self.session_ref is not None:
+            prefix = {
+                "douyin": "sess_douyin_",
+                "xiaohongshu": "sess_xhs_",
+                "x": "sess_x_",
+            }[self.platform]
+            if not self.session_ref.startswith(prefix):
+                raise ValueError("session_ref platform does not match plan platform")
+        if self.write_actions:
+            if self.platform != "x" or self.session_ref is None:
+                raise ValueError("X publishing requires an authorized X browser session")
+        return self
 
 
 class AgentRunResult(BaseModel):

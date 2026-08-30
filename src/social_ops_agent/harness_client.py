@@ -120,14 +120,23 @@ class HarnessJsonRpcClient:
         self,
         *,
         session_id: str,
-        prompt: str,
+        prompt: str | None = None,
+        content_blocks: list[JsonObject] | None = None,
         on_event: Callable[[JsonObject], None] | None = None,
     ) -> HarnessTurnResult:
+        if content_blocks is None:
+            if prompt is None:
+                raise HarnessError("Harness turn requires prompt text or content blocks")
+            content_blocks = [{"type": "text", "text": prompt}]
+        elif prompt is not None:
+            raise HarnessError("pass either prompt or content_blocks, not both")
+        if not content_blocks:
+            raise HarnessError("Harness turn content blocks cannot be empty")
         response = self._request(
             "session/prompt",
             {
                 "sessionId": session_id,
-                "contentBlocks": [{"type": "text", "text": prompt}],
+                "contentBlocks": content_blocks,
             },
         )
         if not isinstance(response, dict) or not isinstance(response.get("messageId"), str):

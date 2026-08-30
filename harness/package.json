@@ -5,6 +5,7 @@
   "description": "Pinned DeepSeek Harness sidecar for Social Agent",
   "dependencies": {
     "@deepseek-ai/dsh-agent-spine-demo": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-attachment-local": "0.1.1-rc.2",
     "@deepseek-ai/dsh-compaction-basic": "0.1.1-rc.2",
     "@deepseek-ai/dsh-llm-pi-ai": "0.1.1-rc.2",
     "@deepseek-ai/dsh-mcp-client": "0.1.1-rc.2",

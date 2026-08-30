@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Protocol, TypeAlias
 
 from .contracts import (
+    AgentAttachment,
     AgentExecutionResult,
     AgentPlan,
     AgentProgress,
@@ -39,8 +40,12 @@ class AgentRuntime(Protocol):
     def propose(
         self,
         message: str,
-        session: SelectedSession,
+        session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
+        *,
+        attachments: tuple[AgentAttachment, ...] = (),
+        media_context: str | None = None,
+        context_summary: str | None = None,
     ) -> RuntimePlan: ...
 
     def execute(
@@ -51,6 +56,8 @@ class AgentRuntime(Protocol):
     ) -> AgentExecutionResult: ...
 
     def cancel(self) -> None: ...
+
+    def close(self) -> None: ...
 
     def health(self) -> RuntimeHealth: ...
 
@@ -75,12 +82,22 @@ class DeterministicAgentRuntime:
     def propose(
         self,
         message: str,
-        session: SelectedSession,
+        session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
+        *,
+        attachments: tuple[AgentAttachment, ...] = (),
+        media_context: str | None = None,
+        context_summary: str | None = None,
     ) -> AgentPlan:
+        del media_context, context_summary
+        if attachments:
+            raise PlanningError("固定 Workflow 不接受多媒体附件。")
+        if session is None:
+            raise PlanningError("平台浏览任务需要选择一个比特浏览器会话。")
         plan = ConversationalPlanner(
             ollama_base_url=self.settings.base_url,
             ollama_model=self.settings.model,
+            api_key=self.settings.api_key,
         ).create_plan(message, session, previous_plan)
         self.policy.validate_plan(plan)
         return plan
@@ -98,6 +115,7 @@ class DeterministicAgentRuntime:
         agent = SocialOperationsAgent.local(
             session_registry_path=self.registry_path,
             output_root=self.output_root,
+            settings=self.settings,
         )
         result = asyncio.run(
             agent.execute_plan(
@@ -111,6 +129,9 @@ class DeterministicAgentRuntime:
 
     def cancel(self) -> None:
         self._cancelled.set()
+
+    def close(self) -> None:
+        return None
 
     def health(self) -> RuntimeHealth:
         return RuntimeHealth(
@@ -144,11 +165,21 @@ class DeepSeekHarnessRuntime:
     def propose(
         self,
         message: str,
-        session: SelectedSession,
+        session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
+        *,
+        attachments: tuple[AgentAttachment, ...] = (),
+        media_context: str | None = None,
+        context_summary: str | None = None,
     ) -> DynamicAgentPlan:
         del previous_plan
-        plan = self.backend.propose(message, session)
+        plan = self.backend.propose(
+            message,
+            session,
+            attachments=attachments,
+            media_context=media_context,
+            context_summary=context_summary,
+        )
         self.policy.validate_plan(plan)
         return plan
 
@@ -165,6 +196,9 @@ class DeepSeekHarnessRuntime:
 
     def cancel(self) -> None:
         self.backend.cancel()
+
+    def close(self) -> None:
+        self.backend.close()
 
     def health(self) -> RuntimeHealth:
         available, detail = self.backend.health()
@@ -194,25 +228,50 @@ class RuntimeRouter:
         self.policy = policy
         self._active_runtime: AgentRuntime | None = None
         self._cancel_requested = False
+        self._deterministic_runtime: DeterministicAgentRuntime | None = None
+        self._harness_runtime: DeepSeekHarnessRuntime | None = None
 
     def propose(
         self,
         message: str,
-        session: SelectedSession,
+        session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
+        *,
+        attachments: tuple[AgentAttachment, ...] = (),
+        media_context: str | None = None,
+        context_summary: str | None = None,
     ) -> RuntimePlan:
         try:
             self.policy.validate_message(message)
         except ExecutionPolicyError as exc:
             raise PlanningPolicyError(str(exc)) from exc
-        if requires_dynamic_harness(message):
-            return self._harness().propose(message, session, previous_plan)
+        if attachments or requires_dynamic_harness(message):
+            return self._harness().propose(
+                message,
+                session,
+                previous_plan,
+                attachments=attachments,
+                media_context=media_context,
+                context_summary=context_summary,
+            )
+        if session is None:
+            raise PlanningError("请添加媒体附件，或选择一个比特浏览器会话。")
         try:
-            return self._deterministic().propose(message, session, previous_plan)
+            return self._deterministic().propose(
+                message,
+                session,
+                previous_plan,
+                context_summary=context_summary,
+            )
         except PlanningPolicyError:
             raise
         except PlanningError:
-            return self._harness().propose(message, session, previous_plan)
+            return self._harness().propose(
+                message,
+                session,
+                previous_plan,
+                context_summary=context_summary,
+            )
 
     def execute(
         self,
@@ -240,22 +299,34 @@ class RuntimeRouter:
     def health(self) -> list[RuntimeHealth]:
         return [self._deterministic().health(), self._harness().health()]
 
+    def close(self) -> None:
+        if self._harness_runtime is not None:
+            self._harness_runtime.close()
+        if self._deterministic_runtime is not None:
+            self._deterministic_runtime.close()
+        self._harness_runtime = None
+        self._deterministic_runtime = None
+
     def _deterministic(self) -> DeterministicAgentRuntime:
-        return DeterministicAgentRuntime(
-            registry_path=self.registry_path,
-            output_root=self.output_root,
-            settings=self.settings,
-            policy=self.policy,
-        )
+        if self._deterministic_runtime is None:
+            self._deterministic_runtime = DeterministicAgentRuntime(
+                registry_path=self.registry_path,
+                output_root=self.output_root,
+                settings=self.settings,
+                policy=self.policy,
+            )
+        return self._deterministic_runtime
 
     def _harness(self) -> DeepSeekHarnessRuntime:
-        return DeepSeekHarnessRuntime(
-            registry_path=self.registry_path,
-            output_root=self.output_root,
-            conversation_id=self.conversation_id,
-            settings=self.settings,
-            policy=self.policy,
-        )
+        if self._harness_runtime is None:
+            self._harness_runtime = DeepSeekHarnessRuntime(
+                registry_path=self.registry_path,
+                output_root=self.output_root,
+                conversation_id=self.conversation_id,
+                settings=self.settings,
+                policy=self.policy,
+            )
+        return self._harness_runtime
 
 
 def _fixed_result(result: AgentRunResult) -> AgentExecutionResult:

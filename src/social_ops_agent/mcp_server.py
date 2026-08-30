@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -12,11 +13,23 @@ from .policy import DEFAULT_EXECUTION_POLICY
 from .settings import LLMSettings
 
 
-SERVER_INSTRUCTIONS = """Local read/analysis Tool plugin bridge for Social Agent.
+_STANDARD_TYPED_TOOLS = {
+    "analyze_content",
+    "browse_posts",
+    "browser_operate",
+    "download_media",
+    "generate_post_copy",
+    "process_watermark",
+    "publish_x_post",
+}
+
+
+SERVER_INSTRUCTIONS = """Local Tool plugin bridge for Social Agent.
 Only use the selected opaque session_ref. Never request raw cookies, passwords,
 verification codes, proxy credentials, or browser fingerprints. Installed Tool
-plugins must not publish, like, comment, follow, repost, message, purchase, or
-log into an account. Original downloaded media must be preserved."""
+plugins must not like, comment, follow, repost, message, purchase, or log into an
+account. X publishing is allowed only through publish_x_post with the one-time
+approval token issued after GUI confirmation. Original downloaded media must be preserved."""
 
 mcp = FastMCP("social-agent-tools", instructions=SERVER_INSTRUCTIONS)
 
@@ -29,6 +42,9 @@ class PluginToolRuntime:
         self.policy = DEFAULT_EXECUTION_POLICY
         self.download_budget_remaining_bytes = self.policy.max_total_download_mb * 1024 * 1024
         self.download_lock = asyncio.Lock()
+        self.publish_lock = asyncio.Lock()
+        self.publish_approval_token = os.getenv("SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN", "")
+        self.publish_approval_consumed = False
         settings = LLMSettings.from_env()
         self.manager = PluginManager()
         self.invoker = PluginInvoker(
@@ -76,6 +92,14 @@ async def call_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[st
     Use this for capabilities added by future plugins after list_plugin_tools.
     Prefer the typed compatibility Tools below for standard social operations.
     """
+    if tool_name in _STANDARD_TYPED_TOOLS:
+        raise ValueError(
+            f"{tool_name} is a standard Tool; call mcp__social__{tool_name} directly"
+        )
+    return await _invoke_plugin_tool(tool_name, arguments)
+
+
+async def _invoke_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     output = await runtime().invoker.call(tool_name, arguments)
     return output if isinstance(output, dict) else {"result": output}
 
@@ -93,7 +117,7 @@ async def browse_posts(
     max_scrolls: int = 8,
 ) -> dict[str, Any]:
     """Browse Douyin, Xiaohongshu, or X through the social-content plugin."""
-    return await call_plugin_tool(
+    return await _invoke_plugin_tool(
         "browse_posts",
         {
             "platform": platform,
@@ -112,7 +136,18 @@ async def browse_posts(
 @mcp.tool()
 async def browser_operate(
     session_ref: str,
-    action: str,
+    action: Literal[
+        "observe",
+        "navigate",
+        "click",
+        "input",
+        "press",
+        "scroll",
+        "back",
+        "forward",
+        "reload",
+        "wait",
+    ],
     url: str | None = None,
     element_ref: str | None = None,
     selector: str | None = None,
@@ -127,8 +162,13 @@ async def browser_operate(
     max_elements: int = 40,
     text_excerpt_chars: int = 4_000,
 ) -> dict[str, Any]:
-    """Perform a read-only operation in an authorized BitBrowser session."""
-    return await call_plugin_tool("browser_operate", locals())
+    """Perform one read-only BitBrowser operation.
+
+    For input, provide exactly one target (normally element_ref from observe) and
+    put the content in value. text is a target locator, not the input content.
+    url is only valid for navigate.
+    """
+    return await _invoke_plugin_tool("browser_operate", locals())
 
 
 @mcp.tool()
@@ -177,7 +217,7 @@ async def analyze_content(
     language_hint: str | None = "zh",
 ) -> dict[str, Any]:
     """Analyze local images, videos, or audio using the analyzer plugin."""
-    return await call_plugin_tool("analyze_content", locals())
+    return await _invoke_plugin_tool("analyze_content", locals())
 
 
 @mcp.tool()
@@ -187,7 +227,7 @@ async def process_watermark(
     repair_quality: str = "auto",
 ) -> dict[str, Any]:
     """Detect watermarks and create repaired copies; originals are preserved."""
-    return await call_plugin_tool("process_watermark", locals())
+    return await _invoke_plugin_tool("process_watermark", locals())
 
 
 @mcp.tool()
@@ -201,7 +241,38 @@ async def generate_post_copy(
     max_characters: int = 300,
 ) -> dict[str, Any]:
     """Generate local social copy drafts grounded in an analysis result."""
-    return await call_plugin_tool("generate_post_copy", locals())
+    return await _invoke_plugin_tool("generate_post_copy", locals())
+
+
+@mcp.tool()
+async def publish_x_post(
+    session_ref: str,
+    text: str,
+    approval_token: str,
+    media_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish exactly one X post approved in the current GUI execution plan."""
+    tool_runtime = runtime()
+    async with tool_runtime.publish_lock:
+        expected = tool_runtime.publish_approval_token
+        if (
+            not expected
+            or tool_runtime.publish_approval_consumed
+            or not hmac.compare_digest(approval_token, expected)
+        ):
+            raise ValueError("X publication approval is missing, invalid, expired, or already used")
+        # Consume before forwarding because an ambiguous browser result must not be retried.
+        tool_runtime.publish_approval_consumed = True
+        output = await tool_runtime.invoker.call(
+            "publish_x_post",
+            {
+                "session_ref": session_ref,
+                "text": text,
+                "approval_token": approval_token,
+                "media_paths": media_paths or [],
+            },
+        )
+        return output if isinstance(output, dict) else {"result": output}
 
 
 def _required_path(name: str, *, file: bool = False) -> Path:

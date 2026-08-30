@@ -52,6 +52,7 @@ class ConversationalPlanner:
         *,
         ollama_base_url: str | None = None,
         ollama_model: str | None = None,
+        api_key: str | None = None,
         timeout_seconds: float = 12.0,
     ) -> None:
         settings = LLMSettings.from_env()
@@ -63,6 +64,7 @@ class ConversationalPlanner:
             ollama_model
             or settings.model
         )
+        self._api_key = api_key or settings.api_key
         self._timeout_seconds = timeout_seconds
 
     def create_plan(
@@ -121,7 +123,10 @@ limit 必须是 1..100；media_format 只能 best、video、audio。
         request = Request(
             f"{self._ollama_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
             method="POST",
         )
         with urlopen(request, timeout=self._timeout_seconds) as response:
@@ -144,7 +149,12 @@ def _deterministic_draft(
     if start_url:
         source = AgentSource.URL
         platform = _platform_from_url(start_url) or platform
-    elif "时间线" in message or "推荐流" in message or "首页" in message:
+    elif (
+        "时间线" in message
+        or "推荐流" in message
+        or "首页" in message
+        or ("随机" in message and not query)
+    ):
         source = AgentSource.TIMELINE
     elif "用户主页" in message or "作者主页" in message:
         source = AgentSource.USER
@@ -164,7 +174,12 @@ def _deterministic_draft(
     if source is AgentSource.USER and not user_key:
         raise PlanningError("没有识别到用户 ID。请写明用户主页对应的 ID。")
 
-    limit = _limit(message) or (previous_plan.limit if previous_plan else 20)
+    requested_limit = _limit(message)
+    limit = (
+        requested_limit
+        or (1 if source is AgentSource.TIMELINE and "随机" in message else None)
+        or (previous_plan.limit if previous_plan else 20)
+    )
     download = "下载" in message or (previous_plan.download if previous_plan and "改成" in message else False)
     remove_watermark = any(word in message for word in ("去水印", "移除水印", "去掉水印")) or (
         previous_plan.remove_watermark if previous_plan and "改成" in message else False

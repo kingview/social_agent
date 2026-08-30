@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from social_ops_agent import ConversationalPlanner, PlanningError, SelectedSession
@@ -49,7 +51,7 @@ def test_rejects_platform_that_does_not_match_selected_session() -> None:
 
 def test_rejects_external_write_actions() -> None:
     planner = ConversationalPlanner()
-    with pytest.raises(PlanningError, match="只允许浏览和下载"):
+    with pytest.raises(PlanningError, match="不执行点赞"):
         planner.create_plan("搜索 web3 并给前10条帖子点赞", DOUYIN_SESSION)
 
 
@@ -64,3 +66,48 @@ def test_plans_watermark_processing_as_an_explicit_extra_tool_step() -> None:
     assert plan.remove_watermark is True
     assert plan.download is True
     assert plan.tool_call_budget == 11
+
+
+def test_plans_one_random_douyin_post_from_recommendation_feed() -> None:
+    planner = ConversationalPlanner()
+
+    plan = planner.create_plan("随机下载一个抖音帖子", DOUYIN_SESSION)
+
+    assert plan.source == "timeline"
+    assert plan.query is None
+    assert plan.limit == 1
+    assert plan.download is True
+    assert plan.tool_call_budget == 2
+
+
+def test_model_fallback_sends_configured_bearer_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str | None] = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": '{"limit": 1}'}}]}
+            ).encode()
+
+    def fake_urlopen(request, *, timeout):
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = str(timeout)
+        return Response()
+
+    monkeypatch.setattr("social_ops_agent.planner.urlopen", fake_urlopen)
+    planner = ConversationalPlanner(
+        ollama_base_url="https://models.example.test/v1",
+        ollama_model="remote-model",
+        api_key="remote-secret",
+    )
+
+    assert planner._ollama_draft("测试", DOUYIN_SESSION, None) == {"limit": 1}
+    assert captured["authorization"] == "Bearer remote-secret"

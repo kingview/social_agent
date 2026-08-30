@@ -1,7 +1,7 @@
 # 多平台 AI 社媒运营 Agent 技术架构
 
-> 版本：v0.8
-> 日期：2026-08-27
+> 版本：v1.0
+> 日期：2026-08-29
 > 适用平台：X、Facebook、Telegram 及后续扩展平台
 
 ## 1. 文档目标
@@ -344,6 +344,8 @@ flowchart TD
 - [GLM-V](https://github.com/zai-org/GLM-V)
 - [InternVL](https://github.com/OpenGVLab/InternVL)
 - [Ollama OpenAI Compatibility](https://docs.ollama.com/api/openai-compatibility)
+- [OpenAI Chat Completions API](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions)
+- [OpenAI API Models](https://developers.openai.com/api/docs/models/all)
 - [vLLM Hardware Installation](https://docs.vllm.ai/en/latest/getting_started/installation/)
 - [FFmpeg Legal](https://ffmpeg.org/legal.html)
 - [PySceneDetect](https://www.scenedetect.com/)
@@ -397,10 +399,13 @@ LangChain 类型不得进入核心领域模型、数据库结构或执行协议�
 - Node.js 要求 `22.19+`，当前开发与打包基线为 Node.js 24。
 - Python GUI 通过 stdio JSON-RPC 启动独立 Harness Runtime，不把 Node 类型暴露给业务层。
 - 规划 Cordis 不加载任何 Tool；只有用户确认计划后才启动执行 Cordis。
-- 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills、工作区上下文和平台写操作。
-- MCP 插件桥保留六个标准具名 Tool，并暴露 `list_plugin_tools` 与 `call_plugin_tool` 发现和调用后续插件能力。
-- 本地模型经 OpenAI-compatible 路由连接 Ollama `qwen3.5:9b`；生产环境仍通过 Model Gateway 路由。
+- 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills 和工作区上下文；平台写操作默认禁用，只有用户确认的 X 发布计划会获得一次性授权。
+- MCP 插件桥保留七个标准具名 Tool，并暴露 `list_plugin_tools` 与 `call_plugin_tool` 发现和调用后续插件能力。
+- 桌面 GUI 的 LLM 设置支持本地 Ollama、OpenAI API 和自定义 OpenAI-compatible 端点；默认连接 Ollama `qwen3.5:9b`，生产环境仍建议通过 Model Gateway 路由。
+- 当前选中的端点、模型和进程内凭据会注入 Planning Cordis、Execution Cordis 及其 MCP 插件进程，避免规划、附件分析和文案生成意外使用不同模型。
+- 非敏感设置写入用户级 `llm-settings.json`；远端 API Key 仅存入 macOS Keychain 或 Windows Credential Manager。OpenAI API 使用独立 Platform API Key，不复用 ChatGPT 消费者订阅或登录会话。
 - Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
+- GUI 的一个会话复用同一组 Planning/Execution Harness 进程；Planning session 和 Execution session 分别保持稳定 ID，避免每轮新建进程导致原生上下文丢失。
 - 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
 
 Harness 是可替换的 `AgentRuntimeAdapter`，其 JSON-RPC event、MCP 名称和内部 session 不能成为跨服务领域协议。升级 Release Candidate 前必须运行契约测试、Tool 白名单测试、无工具规划测试和真实模型冒烟测试。
@@ -421,7 +426,47 @@ RuntimeRouter
 └── AgentExecutionResult
 ```
 
-Qt Worker 只调用 `RuntimeRouter.propose/execute/cancel`，不导入具体 Tool 或创建 Harness Backend。`ExecutionPolicy` 是浏览数量、批次、总下载量与 Tool 次数的应用层权威限制；Prompt 和 Tool Schema 只能进一步收紧，不能放宽。`LLMSettings` 使用 `SOCIAL_AGENT_LLM_*` 通用变量，并兼容旧 `SOCIAL_AGENT_OLLAMA_*` 变量，因而可以无代码切换 Ollama、LiteLLM、vLLM 或 SGLang。
+Qt Worker 只调用 `RuntimeRouter.propose/execute/cancel`，不导入具体 Tool 或创建 Harness Backend。`ExecutionPolicy` 是浏览数量、批次、总下载量与 Tool 次数的应用层权威限制；Prompt 和 Tool Schema 只能进一步收紧，不能放宽。`LLMSettingsStore` 读取 GUI 设置并通过系统凭据存储恢复密钥，`LLMSettings` 再作为不可变快照注入 `RuntimeRouter`。切换来源时关闭旧 Harness 进程并用相同 GUI 会话 ID 重建 Runtime；已经生成但尚未执行的计划同时作废，防止跨模型执行。`SOCIAL_AGENT_LLM_*` 通用变量仍用于部署覆盖，并兼容旧 `SOCIAL_AGENT_OLLAMA_*` 变量。
+
+#### 6.3.1 Harness 多模态与上下文边界
+
+截至 2026-08-29，上游 `master`（`0.1.2-alpha.1`）的核心 `ContentBlockMap` 原生包含
+`text`、`reasoning`、`image`、`tool-call` 和 `tool-result`，没有 `audio` 或 `video`。
+附件服务只接受 PNG、JPEG、WebP、GIF。桌面端必须据此区分原生链路和兼容链路：
+
+```text
+用户文字 + 图片
+→ SDK 内联编码图片准入
+→ dsh-attachment-local 内容寻址持久化
+→ Harness ImageBlock
+→ llm-pi-ai 图片模型投影
+→ JSONL session / checkpoint / compaction
+
+用户文字 + 视频 / 音频
+→ Agent-owned 输入暂存目录
+→ media.analyze_content（FFmpeg / OCR / ASR / VLM）
+→ 有来源标记的结构化媒体证据
+→ 同一 Harness user turn 的 TextBlock
+→ JSONL session / checkpoint / compaction
+```
+
+图片不得以本地路径或 Base64 直接写入 session 日志。已发布 npm 版本仍为
+`0.1.1-rc.2`，因此当前使用薄 JSON-RPC 兼容入口接收内联图片，内部调用 Harness 官方
+`admitEncodedImages` 和 `AttachmentStore`，落盘后只把不可变 `ImageAttachmentRef` 放入
+`ImageBlock`。上游正式发布含同等 SDK 能力的版本后，删除兼容入口并直接使用官方 server。
+
+视频和音频不得伪装成 Harness 原生内容块，也不把完整二进制塞入 Prompt。媒体 Tool 的
+摘要、OCR、转写、证据、置信度和警告作为不可信内容数据进入会话；未来媒体 Tool 暴露
+关键帧附件引用后，可把筛选后的关键帧继续通过原生 `ImageBlock` 注入。
+
+上下文由 Harness session 负责，而不是由 GUI 重放整段聊天文本：
+
+- Planning 与 Execution 各自使用稳定 session，并共享同一个附件内容寻址存储。
+- 同一 GUI 会话内保持 Harness 进程存活；新会话或窗口关闭时显式释放进程。
+- Planning session 保存用户文字、原生图片、模型计划和压缩历史。
+- Execution session 保存用户确认后的计划、附件、Tool 调用和结果。
+- Execution 的最终摘要会桥接到下一次 Planning 输入，弥合两个权限不同的 Cordis 会话；原始图片和各自历史仍由 Harness 管理。
+- 视频/音频预处理失败必须显式报错或降级，禁止静默假装模型已理解媒体。
 
 ### 6.4 LangGraph
 
@@ -522,28 +567,31 @@ tools/
     └── create_manual_task
 ```
 
-当前本地桌面工具包已经注册以下无外部写副作用能力：
+当前本地桌面工具包已经注册以下能力：
 
 | Tool | 版本 | 输入 | 输出 | 权限 |
 |---|---:|---|---|---|
 | `browser.operate` | `1.0.0` | 平台专属 `session_ref`、单个受限动作、可选元素引用/定位条件和等待参数 | 当前 URL、标题、正文摘要、可交互元素引用与警告 | `social_content.read`、`browser_session.use`、`browser_ui.operate` |
 | `social.browse_posts` | `1.0.0` | 抖音、小红书或 X 的查询条件、分类、限制和平台专属 `session_ref` | 结构化帖子 URL、作者、正文、时间、媒体类型与互动量 | `social_content.read`、`browser_session.use` |
 | `social.download_media` | `1.7.0` | HTTPS 帖子 URL、下载限制、可选 `session_ref` | 帖子元数据、本地 artifact 清单与非敏感网络路由标识 | `social_content.read`、`media.download` |
+| `social.publish_x_post` | `1.0.0` | X 专属 `session_ref`、最终文案、最多 4 个 Agent 输出目录媒体、一次性审批令牌 | `published`/`failed`/`unknown`、可选帖子 URL 与警告 | `social_content.write`、`browser_session.use`、`browser_ui.operate` |
 | `media.analyze_content` | `1.1.1` | 下载器 artifact 清单、帖子正文和分析选项 | `ContentAnalysisOutput` | `media.analyze` |
 | `media.process_watermark` | `1.4.0` | 视频 artifact、检测/去除模式、修复质量、时序一致性、置信度、自动动态检测、人工框选/跟踪参数和授权确认 | 水印区域、类型、置信度、实际修复质量/方法、原始 artifact 与可选衍生 artifact | `media.analyze`、`media.transform` |
 | `media.generate_post_copy` | `1.0.0` | `ContentAnalysisOutput`、平台、语气、长度和生成数量 | `GeneratePostCopyOutput` | `media.generate_copy` |
 
 `media.generate_post_copy` 不直接发布内容。它只生成结构化候选，继续发布时必须进入平台写操作的 Policy、审批和审计链。桌面 GUI 与 Agent 调用共用同一 Pydantic 契约、OpenAI-compatible 模型适配器和审计日志。生成过程把分析结果和用户补充要求都视为不可信数据，避免 Prompt 注入；文案不得编造分析证据之外的事实。
 
+`social.publish_x_post` 是当前唯一允许的外部写 Tool，并且不复用通用 `browser.operate` 的点击能力。只有用户文字明确表达发布到 X、所选 `session_ref` 属于 X、规划契约写入 `write_actions=["publish_x"]`，且用户在 GUI 的高风险确认框中确认后，Execution Backend 才启动新的隔离 MCP 进程并签发随机一次性令牌。令牌同时由核心 MCP 与插件验证，在打开/操作浏览器前消费，执行结束立即销毁。一次计划最多发布一条；HTTP/GraphQL 失败或结果不明均不自动重试。媒体必须位于 Agent 输出根目录内且最多 4 个，审计日志排除令牌。通用页面 Tool 继续拦截发布按钮与文件输入，因此无法绕过专用发布契约。
+
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
 `social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书或 X 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。单次登录态下载时，Executor 先打开对应窗口以应用当前网络配置，再经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的 HTTP/HTTPS/SOCKS5 代理；Cookie 写入 `0600` 临时文件，代理仅以瞬时内存值注入 `yt-dlp`、图片和抖音后备下载链路。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时使用本机网络并输出 `direct`；两种结果均不包含代理主机、端口、账号或密码。成功或失败后删除临时 Cookie。会话的平台范围必须与 URL 匹配，登录失效返回稳定错误码并转人工重新登录。当前实现不自动登录、不修改或轮换代理和指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
 
-`social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成构成可审计的组合工作流。
+`social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成 → 可选审批后发布 X 构成可审计的组合工作流。
 
 `browser.operate` 补足无法预先固化的平台页面流程。比特浏览器官方 Local API 负责 Profile 生命周期：健康检查、列表/详情、创建/修改、打开/关闭、代理和指纹配置等；页面内 DOM 点击、输入和滚动不属于 Local API 端点。Tool 因此只调用 `/browser/open` 获取回环地址上的 WebSocket/HTTP CDP 端点，再由 Playwright 操作该 Profile 中的可见标签页。支持 `observe`、`navigate`、`click`、`input`、`press`、`scroll`、`back`、`forward`、`reload` 和 `wait`；`observe` 返回短期 `element_ref`，供后续动作复用。导航仅接受公开 HTTPS 地址；禁止密码、验证码、密钥和文件输入，并在点击前拦截发布、互动、交易、账户变更及删除类控件。每个 `session_ref` 串行操作，目标标签页和元素引用仅保留在本机进程内，页面正文仍按不可信输入处理。当前版本不调用 `/browser/add`、`/browser/modify`、`/browser/close`、`/browser/delete` 或代理批量修改接口，Profile、代理和指纹继续由用户在比特浏览器中预配置。
 
-本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“逐步点击/输入/翻页、下载后分析、按观察继续搜索、筛选、总结、生成文案”等非固定路径进入 DeepSeek Harness。规划阶段使用无 Tool Cordis，确认后使用仅含已安装、已启用插件能力的 MCP Tool Bridge；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
+本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“逐步点击/输入/翻页、下载后分析、按观察继续搜索、筛选、总结、生成文案、发布到 X”等非固定路径进入 DeepSeek Harness。X 发布计划在执行前显示独立外部写确认框。规划阶段使用无 Tool Cordis，确认后使用仅含已安装、已启用插件能力的 MCP Tool Bridge；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
 
 `media.process_watermark` 与下载器保持分离。下载器始终保存原始 artifact；水印 Tool 用 OpenCV 抽帧检测画面任意位置的持久静态叠加层，并从每个采样帧提取文字/Logo 候选，通过归一化边缘描述子跨帧聚类：同一外观在至少 35% 采样帧中重复、位置变化且相似度达到高置信阈值时，自动判定为动态水印。轨迹不要求从首个采样帧开始，周期滚动水印与固定水印可在同一视频中同时返回。仅在任务明确要求、用户确认授权且候选达到置信度和面积阈值时才生成带 `derived_from_sha256` 的衍生 artifact。默认的本机时序修复不再擦除整个粗检测框：它从多帧持久边缘生成细粒度笔画 mask，以动态候选首次可靠出现的时间点建立模板并向视频前后双向跟踪；局部匹配降级时执行全画面重新定位，以处理滚动水印的循环跳转。随后逐帧 Telea inpaint，并使用稠密光流把上一帧修复结果对齐后仅在 mask 内低比例融合，以降低闪烁和矩形模糊。快速模式保留 FFmpeg `delogo`/矩形 inpaint 作为低成本路径。低置信度、间歇出现或复杂形变候选可在 Watermark Studio 人工框选首帧区域后跟踪，并强制标记为需要人工检查。Social Agent 可将其作为每个下载批次后的可选步骤，原文件禁止覆盖。
 
@@ -616,9 +664,9 @@ SocialAgent.app
 
 安装位置：macOS 为 `~/Library/Application Support/SocialAgent/plugins`，Windows 为 `%LOCALAPPDATA%\SocialAgent\plugins`。Agent App 不修改自身 Bundle，卸载插件也不删除下载结果、分析结果或会话注册表。每个插件仍使用独立解释器和 stdio MCP 进程，但进程由 Core 内的 Plugin Host 按需启动并跨 Tool 调用复用；同一插件内请求串行进入其 MCP session，避免不安全的并发访问浏览器或模型。禁用、升级、卸载以及版本变化会关闭旧进程。启动握手会严格比较 MCP 实际 Tool 集合与清单白名单，不匹配时拒绝使用。
 
-插件虚拟环境保持版本隔离；安装后对 `site-packages` 的普通不可变文件计算 SHA-256，并以同卷硬链接接入 `runtimes/package-store-v1`。这样依赖冲突仍由各插件自己的 venv 解决，而 Qt、MCP、Pydantic 等字节完全相同的文件只保存一次；平台不支持硬链接时安全退化为普通独立文件。卸载或升级后只清理没有插件引用的内容。Core 的六个标准 Tool 只做稳定兼容转发，未知新能力通过默认返回实时 schema 的 `list_plugin_tools` 发现、`call_plugin_tool` 调用。同名 Tool 由多个启用插件提供时拒绝执行，避免不确定路由。
+插件虚拟环境保持版本隔离；安装后对 `site-packages` 的普通不可变文件计算 SHA-256，并以同卷硬链接接入 `runtimes/package-store-v1`。这样依赖冲突仍由各插件自己的 venv 解决，而 Qt、MCP、Pydantic 等字节完全相同的文件只保存一次；平台不支持硬链接时安全退化为普通独立文件。卸载或升级后只清理没有插件引用的内容。Core 的七个标准 Tool 只做稳定兼容转发，未知新能力通过默认返回实时 schema 的 `list_plugin_tools` 发现、`call_plugin_tool` 调用。同名 Tool 由多个启用插件提供时拒绝执行，避免不确定路由。
 
-插件代码具有本机执行权限，因此生产分发必须在现有结构上增加发布者签名、归档 SHA-256、可信源、撤销列表和升级回滚策略。当前本地开发版只接受用户主动选择的安装包。Python 依赖安装需要 3.11+ 引导解释器，可用 `SOCIAL_AGENT_PLUGIN_PYTHON` 指定；大型模型应首次使用时下载到共享模型缓存，不放回 Agent App。插件能力禁用或缺失时，规划器和执行器必须明确报告，不能静默回退为未授权实现。
+插件代码具有本机执行权限，因此生产分发必须在现有结构上增加发布者签名、归档 SHA-256、可信源、撤销列表和升级回滚策略。当前本地开发版只接受用户主动选择的安装包。Python 依赖安装需要 3.11+ 引导解释器，安装器优先选择与包内 ABI 锁匹配的解释器，也可用 `SOCIAL_AGENT_PLUGIN_PYTHON` 指定；包含 PaddleOCR 的媒体插件当前以 Python 3.12 构建和安装，避免 Python 3.14 尚无 Paddle wheel 的兼容问题。大型模型应首次使用时下载到共享模型缓存，不放回 Agent App。插件能力禁用或缺失时，规划器和执行器必须明确报告，不能静默回退为未授权实现。
 
 ## 8. 固化业务工作流
 
@@ -1638,17 +1686,17 @@ MVP 可以共享一个 PostgreSQL 集群，但必须使用独立 Schema、Reposi
 | 固定流程使用什么 | Temporal |
 | 动态 Agent 使用什么 | 桌面 MVP 使用 DeepSeek Harness；服务端通过 Adapter 选配 LangGraph |
 | Runtime 如何解耦 GUI | `RuntimeRouter` + `AgentRuntime`，统一输出 `AgentExecutionResult` |
-| 模型端点如何配置 | `SOCIAL_AGENT_LLM_*`；兼容旧 `SOCIAL_AGENT_OLLAMA_*` |
+| 模型端点如何配置 | 桌面 LLM 设置支持 Ollama、OpenAI API、自定义 OpenAI-compatible；系统凭据管理器保存密钥；部署可用 `SOCIAL_AGENT_LLM_*` 覆盖 |
 | Harness 如何引入 | npm 锁版本安装；修改内核时才维护独立 Fork/Submodule |
 | 是否必须使用 LangChain | 否，只作为可替换组件库 |
 | 多模型如何接入 | LiteLLM Proxy + Model Gateway |
 | Tool 在哪里定义 | 自研 Tool Registry，Pydantic/JSON Schema 为权威协议 |
 | 桌面 Tool 如何部署 | `.socialtool` 用户级插件；独立 Python/MCP 进程，不写入 Agent App |
-| LLM 是否直接执行外部动作 | 否，只生成 ProposedAction |
+| LLM 是否直接执行外部动作 | 未审批时否；已确认的 X 发布计划只获得一次性、单次 Tool 授权 |
 | 外部操作如何执行 | Policy Engine + Approval + Execution Gateway |
 | 账号如何选择 | 确定性约束求解和负载分配 |
 | 风险后如何优化 | 熔断、复盘、离线评测、审批后发布 |
-| 多模态如何处理 | 确定性预处理 + 专用模型 + 统一结构化输出 |
+| 多模态如何处理 | 图片走 Harness 原生 ImageBlock；视频/音频确定性预处理 + 专用模型 + 同 session 结构化上下文 |
 | 本地内容理解模型如何选择 | 默认 Qwen3.5-9B；桌面 Qwen3.5-4B；边缘 MiniCPM-V 4.6；高质量复核 Qwen3.8-27B |
 | 如何新增平台 | 实现 `PlatformConnector` 并注册能力，不修改核心编排 |
 | 如何新增 Tool | 发布版本化 `ToolSpec` 和 Executor 插件 |

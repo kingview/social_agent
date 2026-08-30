@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-ops-agent"
-version = "0.6.0"
+version = "0.8.1"
 description = "A local conversational agent that orchestrates social browsing and download tools"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "keyring>=25,<26",
     "mcp>=1.26,<2",
     "pydantic>=2.10,<3",
     "pyside6-essentials==6.11.2",

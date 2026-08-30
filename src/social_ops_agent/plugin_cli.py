@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     lock.add_argument("--manifest", type=Path, required=True)
     lock.add_argument("--wheel", type=Path, action="append", required=True)
     lock.add_argument("--output-directory", type=Path, required=True)
+    lock.add_argument(
+        "--python",
+        type=Path,
+        help="Python interpreter whose ABI and dependency compatibility should be locked",
+    )
     return parser
 
 
@@ -51,6 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.manifest,
                 arguments.wheel,
                 arguments.output_directory,
+                arguments.python,
             )
             print(output)
             return 0
