@@ -12,6 +12,11 @@ DOUYIN_SESSION = SelectedSession(
     platform="douyin",
     profile_name="抖音账号 01",
 )
+TELEGRAM_SESSION = SelectedSession(
+    session_ref="sess_telegram_abcdefghijklmnopqrstuvwx",
+    platform="telegram",
+    profile_name="Telegram 账号 01",
+)
 
 
 def test_plans_keyword_search_and_one_hundred_downloads() -> None:
@@ -28,7 +33,7 @@ def test_plans_keyword_search_and_one_hundred_downloads() -> None:
     assert plan.download is True
     assert plan.download_batch_size == 20
     assert plan.tool_call_budget == 6
-    assert plan.requires_confirmation is True
+    assert plan.requires_confirmation is False
 
 
 def test_follow_up_can_adjust_previous_plan() -> None:
@@ -111,3 +116,17 @@ def test_model_fallback_sends_configured_bearer_key(
 
     assert planner._ollama_draft("测试", DOUYIN_SESSION, None) == {"limit": 1}
     assert captured["authorization"] == "Bearer remote-secret"
+
+
+def test_plans_telegram_channel_browse_and_download() -> None:
+    plan = ConversationalPlanner().create_plan(
+        "从 https://t.me/weme_download 下载前20条频道消息的图片、视频和文本",
+        TELEGRAM_SESSION,
+    )
+
+    assert plan.platform == "telegram"
+    assert plan.source == "url"
+    assert plan.view == "posts"
+    assert str(plan.start_url) == "https://t.me/weme_download"
+    assert plan.limit == 20
+    assert plan.download is True

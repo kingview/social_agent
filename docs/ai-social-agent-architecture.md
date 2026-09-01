@@ -572,8 +572,8 @@ tools/
 | Tool | 版本 | 输入 | 输出 | 权限 |
 |---|---:|---|---|---|
 | `browser.operate` | `1.0.0` | 平台专属 `session_ref`、单个受限动作、可选元素引用/定位条件和等待参数 | 当前 URL、标题、正文摘要、可交互元素引用与警告 | `social_content.read`、`browser_session.use`、`browser_ui.operate` |
-| `social.browse_posts` | `1.0.0` | 抖音、小红书或 X 的查询条件、分类、限制和平台专属 `session_ref` | 结构化帖子 URL、作者、正文、时间、媒体类型与互动量 | `social_content.read`、`browser_session.use` |
-| `social.download_media` | `1.7.0` | HTTPS 帖子 URL、下载限制、可选 `session_ref` | 帖子元数据、本地 artifact 清单与非敏感网络路由标识 | `social_content.read`、`media.download` |
+| `social.browse_posts` | `1.1.0` | 抖音、小红书、X 或 Telegram Web 的查询/频道条件、分类、限制和平台专属 `session_ref` | 结构化帖子 URL、作者、正文、时间、媒体类型与互动量 | `social_content.read`、`browser_session.use` |
+| `social.download_media` | `1.9.0` | HTTPS 帖子 URL、下载限制、可选 `session_ref`；Telegram 可指定频道遍历范围和消息上限 | 帖子元数据、本地 artifact、网络路由、Telegram 检查点/完成状态/停止原因 | `social_content.read`、`media.download` |
 | `social.publish_x_post` | `1.0.0` | X 专属 `session_ref`、最终文案、最多 4 个 Agent 输出目录媒体、一次性审批令牌 | `published`/`failed`/`unknown`、可选帖子 URL 与警告 | `social_content.write`、`browser_session.use`、`browser_ui.operate` |
 | `media.analyze_content` | `1.1.1` | 下载器 artifact 清单、帖子正文和分析选项 | `ContentAnalysisOutput` | `media.analyze` |
 | `media.process_watermark` | `1.4.0` | 视频 artifact、检测/去除模式、修复质量、时序一致性、置信度、自动动态检测、人工框选/跟踪参数和授权确认 | 水印区域、类型、置信度、实际修复质量/方法、原始 artifact 与可选衍生 artifact | `media.analyze`、`media.transform` |
@@ -585,7 +585,7 @@ tools/
 
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
-`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书或 X 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。单次登录态下载时，Executor 先打开对应窗口以应用当前网络配置，再经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的 HTTP/HTTPS/SOCKS5 代理；Cookie 写入 `0600` 临时文件，代理仅以瞬时内存值注入 `yt-dlp`、图片和抖音后备下载链路。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时使用本机网络并输出 `direct`；两种结果均不包含代理主机、端口、账号或密码。成功或失败后删除临时 Cookie。会话的平台范围必须与 URL 匹配，登录失效返回稳定错误码并转人工重新登录。当前实现不自动登录、不修改或轮换代理和指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
+`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书、X 或 Telegram Web 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。抖音、小红书和 X 的单次登录态下载经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的代理；Telegram 不导出 Cookie，而是在已登录页面上下文内读取消息和分块获取媒体，因此自然沿用 Profile 代理。Telegram 频道全量任务由下载 Tool 内部的确定性状态机执行：稳定输出目录按会话、频道和媒体格式派生，逐条写入 JSONL manifest，重试时跳过已完成消息，并以消息数、总容量、页面停滞或到达顶部作为显式终止条件。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时输出 `direct`，均不包含代理详情。当前实现不自动登录、不修改或轮换代理和指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
 
 `social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成 → 可选审批后发布 X 构成可审计的组合工作流。
 

@@ -96,7 +96,7 @@ class ConversationalPlanner:
     ) -> dict[str, Any]:
         previous = previous_plan.model_dump(mode="json", exclude={"session_ref"}) if previous_plan else None
         system = """你是本地社媒只读 Agent 的计划器。只输出 JSON，不执行操作。
-允许平台：douyin、xiaohongshu、x。
+允许平台：douyin、xiaohongshu、x、telegram。
 允许 source：search、user、timeline、url。
 允许 view：top、latest、media、posts、replies、users。
 字段：platform,source,view,query,user_key,start_url,limit,download,remove_watermark,media_format。
@@ -228,7 +228,7 @@ def _validated_plan(
         1 + batches + (batches if draft.get("remove_watermark") else 0),
     )
     draft["max_scrolls"] = min(50, max(8, ceil(limit / 4)))
-    draft["requires_confirmation"] = True
+    draft["requires_confirmation"] = False
     allowed = set(AgentPlan.model_fields)
     try:
         return AgentPlan.model_validate({key: value for key, value in draft.items() if key in allowed})
@@ -244,6 +244,8 @@ def _detect_platform(message: str) -> AgentPlatform | None:
         return AgentPlatform.XIAOHONGSHU
     if "twitter" in lowered or re.search(r"(?:^|\s)x(?:平台|上|\s|$)", lowered):
         return AgentPlatform.X
+    if "telegram" in lowered or "电报" in message or "tg频道" in lowered:
+        return AgentPlatform.TELEGRAM
     return None
 
 
@@ -259,6 +261,8 @@ def _platform_from_url(url: str) -> AgentPlatform | None:
         return AgentPlatform.XIAOHONGSHU
     if "x.com" in url or "twitter.com" in url:
         return AgentPlatform.X
+    if "t.me/" in url or "telegram.me/" in url or "web.telegram.org" in url:
+        return AgentPlatform.TELEGRAM
     return None
 
 
@@ -301,7 +305,11 @@ def _view(platform: AgentPlatform, source: AgentSource, message: str) -> AgentVi
     if source is AgentSource.TIMELINE:
         return AgentView.LATEST if platform is AgentPlatform.X else AgentView.TOP
     if source is AgentSource.URL:
-        return AgentView.LATEST if platform is AgentPlatform.X else AgentView.TOP
+        if platform is AgentPlatform.X:
+            return AgentView.LATEST
+        if platform is AgentPlatform.TELEGRAM:
+            return AgentView.POSTS
+        return AgentView.TOP
     if platform is AgentPlatform.DOUYIN and "用户" in message:
         return AgentView.USERS
     if "最新" in message and platform is not AgentPlatform.DOUYIN:

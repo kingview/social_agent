@@ -12,6 +12,7 @@ class AgentPlatform(StrEnum):
     DOUYIN = "douyin"
     XIAOHONGSHU = "xiaohongshu"
     X = "x"
+    TELEGRAM = "telegram"
 
 
 class AgentSource(StrEnum):
@@ -66,7 +67,7 @@ class AgentPlan(BaseModel):
     objective: str = Field(min_length=1, max_length=2_000)
     platform: AgentPlatform
     session_ref: str = Field(
-        pattern=r"^sess_(?:douyin|xhs|x)_[A-Za-z0-9_-]{20,80}$",
+        pattern=r"^sess_(?:douyin|xhs|x|telegram)_[A-Za-z0-9_-]{20,80}$",
         max_length=96,
     )
     source: AgentSource = AgentSource.SEARCH
@@ -83,7 +84,7 @@ class AgentPlan(BaseModel):
     max_total_download_mb: int = Field(default=5_000, ge=100, le=20_000)
     max_scrolls: int = Field(default=30, ge=0, le=50)
     tool_call_budget: int = Field(default=10, ge=1, le=20)
-    requires_confirmation: bool = True
+    requires_confirmation: bool = False
 
     @model_validator(mode="after")
     def validate_executable_plan(self) -> AgentPlan:
@@ -91,6 +92,7 @@ class AgentPlan(BaseModel):
             AgentPlatform.DOUYIN: "sess_douyin_",
             AgentPlatform.XIAOHONGSHU: "sess_xhs_",
             AgentPlatform.X: "sess_x_",
+            AgentPlatform.TELEGRAM: "sess_telegram_",
         }[self.platform]
         if not self.session_ref.startswith(prefix):
             raise ValueError("session_ref platform does not match plan platform")
@@ -113,6 +115,10 @@ class AgentPlan(BaseModel):
                 AgentSource.TIMELINE: {AgentView.TOP},
                 AgentSource.URL: {AgentView.TOP},
             },
+            AgentPlatform.TELEGRAM: {
+                AgentSource.USER: {AgentView.POSTS},
+                AgentSource.URL: {AgentView.POSTS},
+            },
         }
         if self.view not in allowed_views[self.platform][self.source]:
             raise ValueError("view is not supported for this platform and source")
@@ -130,6 +136,7 @@ class AgentPlan(BaseModel):
                 AgentPlatform.DOUYIN: ("douyin.com", "iesdouyin.com"),
                 AgentPlatform.XIAOHONGSHU: ("xiaohongshu.com", "xhslink.com"),
                 AgentPlatform.X: ("x.com", "twitter.com"),
+                AgentPlatform.TELEGRAM: ("t.me", "telegram.me", "web.telegram.org"),
             }[self.platform]
             if not any(host == domain or host.endswith(f".{domain}") for domain in domains):
                 raise ValueError("start_url platform does not match plan platform")
@@ -154,18 +161,18 @@ class DynamicAgentPlan(BaseModel):
 
     mode: Literal["dynamic_harness"] = "dynamic_harness"
     objective: str = Field(min_length=1, max_length=2_000)
-    platform: Literal["douyin", "xiaohongshu", "x"] | None = None
+    platform: Literal["douyin", "xiaohongshu", "x", "telegram"] | None = None
     session_ref: str | None = Field(
         default=None,
-        pattern=r"^sess_(?:douyin|xhs|x)_[A-Za-z0-9_-]{20,80}$",
+        pattern=r"^sess_(?:douyin|xhs|x|telegram)_[A-Za-z0-9_-]{20,80}$",
     )
     summary: str = Field(min_length=1, max_length=2_000)
     steps: list[str] = Field(min_length=1, max_length=12)
     attachments: list[AgentAttachment] = Field(default_factory=list, max_length=8)
     media_context: str | None = Field(default=None, max_length=80_000)
     write_actions: list[Literal["publish_x"]] = Field(default_factory=list, max_length=1)
-    max_tool_calls: int = Field(default=20, ge=1, le=20)
-    requires_confirmation: bool = True
+    max_tool_calls: int = Field(default=20, ge=1, le=200)
+    requires_confirmation: bool = False
 
     @model_validator(mode="after")
     def validate_optional_browser_session(self) -> DynamicAgentPlan:
@@ -176,6 +183,7 @@ class DynamicAgentPlan(BaseModel):
                 "douyin": "sess_douyin_",
                 "xiaohongshu": "sess_xhs_",
                 "x": "sess_x_",
+                "telegram": "sess_telegram_",
             }[self.platform]
             if not self.session_ref.startswith(prefix):
                 raise ValueError("session_ref platform does not match plan platform")

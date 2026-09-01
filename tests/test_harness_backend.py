@@ -21,7 +21,7 @@ def test_dynamic_plan_contract_binds_platform_and_opaque_session() -> None:
         steps=["搜索帖子", "下载媒体", "分析并总结"],
     )
 
-    assert plan.requires_confirmation is True
+    assert plan.requires_confirmation is False
     assert plan.mode == "dynamic_harness"
     assert plan.max_tool_calls == 20
 
@@ -42,6 +42,7 @@ def test_dynamic_marker_routes_complex_tasks_to_harness() -> None:
     assert requires_dynamic_harness("打开抖音，点击搜索框输入 Web3 后翻页")
     assert not requires_dynamic_harness("搜索 Web3 并下载前20个帖子")
     assert requires_dynamic_harness("生成一条文案并发布到X")
+    assert requires_dynamic_harness("下载 Telegram 频道的所有图片和视频")
 
 
 def test_planning_policy_runs_before_any_llm_planner() -> None:
@@ -73,3 +74,44 @@ def test_model_authored_extra_fields_are_not_part_of_plan_contract() -> None:
     )
 
     assert "extra_reminder" not in plan.model_dump()
+
+
+def test_x_publish_plan_still_requires_one_time_confirmation() -> None:
+    plan = _validated_dynamic_plan(
+        {"summary": "生成并发布", "steps": ["生成文案", "发布到 X"]},
+        message="生成文案并发布到X",
+        session=type(
+            "Session",
+            (),
+            {
+                "platform": "x",
+                "session_ref": "sess_x_abcdefghijklmnopqrstuvwx",
+            },
+        )(),
+        attachments=(),
+        media_context=None,
+        max_tool_calls=20,
+    )
+
+    assert plan.write_actions == ["publish_x"]
+    assert plan.requires_confirmation is True
+
+
+def test_full_telegram_channel_plan_uses_normal_budget_after_tool_refactor() -> None:
+    plan = _validated_dynamic_plan(
+        {"summary": "全量下载频道", "steps": ["分批浏览", "下载媒体和文本"]},
+        message="下载这个 Telegram 频道的所有图片、视频和文本",
+        session=type(
+            "Session",
+            (),
+            {
+                "platform": "telegram",
+                "session_ref": "sess_telegram_abcdefghijklmnopqrstuvwx",
+            },
+        )(),
+        attachments=(),
+        media_context=None,
+        max_tool_calls=200,
+    )
+
+    assert plan.max_tool_calls == 20

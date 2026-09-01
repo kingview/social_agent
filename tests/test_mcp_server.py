@@ -19,6 +19,9 @@ def test_mcp_exposes_typed_tools_and_the_plugin_bridge() -> None:
         "generate_post_copy",
         "publish_x_post",
     }
+    download_schema = mcp._tool_manager._tools["download_media"].parameters
+    assert download_schema["properties"]["telegram_scope"]["default"] == "messages"
+    assert download_schema["properties"]["telegram_max_messages"]["default"] == 2000
 
 
 def test_plugin_bridge_rejects_standard_tools_before_starting_a_plugin() -> None:

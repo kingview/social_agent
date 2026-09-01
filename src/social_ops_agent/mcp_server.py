@@ -116,7 +116,7 @@ async def browse_posts(
     max_items: int = 20,
     max_scrolls: int = 8,
 ) -> dict[str, Any]:
-    """Browse Douyin, Xiaohongshu, or X through the social-content plugin."""
+    """Browse Douyin, Xiaohongshu, X, or Telegram Web through the social-content plugin."""
     return await _invoke_plugin_tool(
         "browse_posts",
         {
@@ -143,6 +143,8 @@ async def browser_operate(
         "input",
         "press",
         "scroll",
+        "swipe_up",
+        "swipe_down",
         "back",
         "forward",
         "reload",
@@ -177,8 +179,10 @@ async def download_media(
     session_ref: str,
     media_format: str = "best",
     max_total_size_mb: int = 1000,
+    telegram_scope: Literal["messages", "channel"] = "messages",
+    telegram_max_messages: int = 2000,
 ) -> dict[str, Any]:
-    """Download via the Profile proxy, or directly when no proxy is configured."""
+    """Download posts, or one complete Telegram channel with checkpoints."""
     tool_runtime = runtime()
     async with tool_runtime.download_lock:
         remaining_mb = tool_runtime.download_budget_remaining_bytes // (1024 * 1024)
@@ -191,6 +195,8 @@ async def download_media(
                 "session_ref": session_ref,
                 "media_format": media_format,
                 "max_total_size_mb": min(max_total_size_mb, remaining_mb),
+                "telegram_scope": telegram_scope,
+                "telegram_max_messages": telegram_max_messages,
             },
         )
         if not isinstance(output, dict):

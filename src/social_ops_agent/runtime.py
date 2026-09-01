@@ -41,6 +41,8 @@ class DownloadInput(BaseModel):
     max_items: int
     max_total_size_mb: int
     session_ref: str
+    telegram_scope: str = "messages"
+    telegram_max_messages: int = 2_000
 
 
 class ArtifactRef(BaseModel):

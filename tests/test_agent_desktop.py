@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from social_ops_agent.desktop import MainWindow
+from social_ops_agent.contracts import AgentPlan
 from social_ops_agent.model_settings_dialog import ModelSettingsDialog
 from social_ops_agent.settings import LLMSettings, LLMSettingsStore
 
@@ -24,7 +25,7 @@ class MemoryCredentials:
         pass
 
 
-def test_desktop_has_conversation_and_confirmation_controls(tmp_path: Path) -> None:
+def test_desktop_has_single_send_control(tmp_path: Path) -> None:
     registry = tmp_path / "sessions.json"
     registry.write_text(
         json.dumps(
@@ -59,12 +60,24 @@ def test_desktop_has_conversation_and_confirmation_controls(tmp_path: Path) -> N
 
     assert "社媒任务助手" in window.windowTitle()
     assert window.session_combo.itemText(0).startswith("抖音")
-    assert window.plan_button.text().startswith("生成计划")
-    assert window.execute_button.text() == "确认并执行计划"
-    assert not window.execute_button.isEnabled()
+    assert window.send_button.text() == "发送"
+    assert window.send_button.isEnabled()
+    assert not hasattr(window, "execute_button")
     assert window.plugins_button.text() == "Tool 插件 · 0"
     assert window.model_button.text() == "LLM · 本地 Ollama · qwen3.5:9b"
     assert "图片 / 视频 / 音频" in window.attach_button.text()
+
+    executions = []
+    window.execute_plan = lambda: executions.append(window._pending_plan)  # type: ignore[method-assign]
+    plan = AgentPlan(
+        objective="搜索帖子",
+        platform="douyin",
+        session_ref="sess_douyin_abcdefghijklmnopqrstuvwx",
+        source="search",
+        query="web3",
+    )
+    window._plan_succeeded(plan)
+    assert executions == [plan]
     window.close()
     app.processEvents()
 

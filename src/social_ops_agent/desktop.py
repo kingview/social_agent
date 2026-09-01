@@ -42,6 +42,7 @@ PLATFORM_LABELS = {
     "douyin": "抖音",
     "xiaohongshu": "小红书",
     "x": "X / Twitter",
+    "telegram": "Telegram Web",
 }
 
 
@@ -218,7 +219,7 @@ class MainWindow(QMainWindow):
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Social Agent")
         title.setObjectName("title")
-        subtitle = QLabel("固定 Workflow + DeepSeek Harness 动态编排；计划确认后才执行。")
+        subtitle = QLabel("固定 Workflow + DeepSeek Harness 动态编排；发送后自动执行。")
         subtitle.setObjectName("subtitle")
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
@@ -287,7 +288,7 @@ class MainWindow(QMainWindow):
         input_layout.setContentsMargins(14, 12, 14, 12)
         self.message_input = QPlainTextEdit()
         self.message_input.setObjectName("messageInput")
-        self.message_input.setPlaceholderText("描述任务；后续也可以说“改成前50条”继续调整计划…")
+        self.message_input.setPlaceholderText("描述任务；后续也可以继续补充或调整要求…")
         self.message_input.setMaximumHeight(100)
         input_layout.addWidget(self.message_input)
 
@@ -312,20 +313,15 @@ class MainWindow(QMainWindow):
         self.cancel_button.setObjectName("secondaryButton")
         self.cancel_button.clicked.connect(self.cancel_execution)
         self.cancel_button.hide()
-        self.execute_button = QPushButton("确认并执行计划")
-        self.execute_button.setObjectName("executeButton")
-        self.execute_button.setEnabled(False)
-        self.execute_button.clicked.connect(self.execute_plan)
-        self.plan_button = QPushButton("生成计划  →")
-        self.plan_button.setObjectName("primaryButton")
-        self.plan_button.clicked.connect(self.request_plan)
+        self.send_button = QPushButton("发送")
+        self.send_button.setObjectName("primaryButton")
+        self.send_button.clicked.connect(self.send_message)
         action_row.addWidget(self.attach_button)
         action_row.addWidget(self.remove_attachment_button)
         action_row.addWidget(hint)
         action_row.addStretch()
         action_row.addWidget(self.cancel_button)
-        action_row.addWidget(self.execute_button)
-        action_row.addWidget(self.plan_button)
+        action_row.addWidget(self.send_button)
         input_layout.addLayout(action_row)
         layout.addWidget(input_frame)
 
@@ -418,7 +414,7 @@ class MainWindow(QMainWindow):
         self.attachment_list.setVisible(visible)
         self.remove_attachment_button.setVisible(visible)
 
-    def request_plan(self) -> None:
+    def send_message(self) -> None:
         record = self._selected_record()
         message = self.message_input.toPlainText().strip()
         attachments = list(self._attachment_paths)
@@ -468,51 +464,20 @@ class MainWindow(QMainWindow):
     def _plan_succeeded(self, plan: RuntimePlan) -> None:
         self.clear_attachments()
         self._pending_plan = plan
-        self.execute_button.setEnabled(True)
-        if isinstance(plan, DynamicAgentPlan):
-            steps = "\n".join(f"{index}. {step}" for index, step in enumerate(plan.steps, 1))
-            publish_warning = ""
-            if plan.write_actions == ["publish_x"]:
-                publish_warning = (
-                    "\n⚠ 此计划包含外部写操作：将通过所选账号公开发布一条 X 帖子；"
-                    "发布请求不会自动重试。"
-                )
-                self.execute_button.setText("确认并自动发布到 X")
-            else:
-                self.execute_button.setText("确认并执行计划")
-            self._append_agent(
-                f"Harness 动态计划已生成：{plan.summary}\n{steps}\n"
-                f"点击确认后，Harness 才能调用白名单 MCP Tools。{publish_warning}"
-            )
-            return
-        self.execute_button.setText("确认并执行计划")
-        self._last_plan = plan
-        if plan.remove_watermark:
-            action = "浏览、下载并在检测到高置信度静态水印时生成去水印副本"
-        else:
-            action = "浏览并下载" if plan.download else "仅浏览"
-        target = plan.query or plan.user_key or str(plan.start_url or "推荐流")
-        batches = (
-            (plan.limit + plan.download_batch_size - 1) // plan.download_batch_size
-            if plan.download
-            else 0
-        )
-        calls = 1 + batches + (batches if plan.remove_watermark else 0)
-        self._append_agent(
-            f"计划已生成：{PLATFORM_LABELS[plan.platform.value]} · {action} · “{target}” · "
-            f"最多 {plan.limit} 条 · 预计最多 {calls} 次 Tool 调用。\n"
-            "点击“确认并执行计划”后开始；在此之前不会访问平台或下载文件。"
-        )
+        if isinstance(plan, AgentPlan):
+            self._last_plan = plan
+        self.execute_plan()
 
     def _plan_failed(self, message: str) -> None:
-        self._append_agent(f"无法生成计划：{message}", error=True)
+        self._append_agent(f"无法处理消息：{message}", error=True)
 
     def _planning_status(self, message: str) -> None:
-        self.plan_button.setText(message)
+        self.progress_label.setText(message)
 
     def _planning_finished(self) -> None:
         self._plan_worker = None
-        self._set_planning(False)
+        if self._execution_worker is None:
+            self._set_planning(False)
 
     def execute_plan(self) -> None:
         if self._pending_plan is None or self._execution_worker is not None:
@@ -529,10 +494,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Cancel,
             )
             if answer is not QMessageBox.StandardButton.Yes:
+                self._pending_plan = None
+                self._append_agent("已取消本次 X 发布。")
                 return
         self._pending_plan = None
-        self.execute_button.setEnabled(False)
-        self.plan_button.setEnabled(False)
+        self.send_button.setEnabled(False)
         self.session_combo.setEnabled(False)
         self.manage_sessions_button.setEnabled(False)
         self.plugins_button.setEnabled(False)
@@ -542,8 +508,10 @@ class MainWindow(QMainWindow):
         self.remove_attachment_button.setEnabled(False)
         self.cancel_button.show()
         self.progress_frame.show()
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self._append_agent("计划已确认，开始执行。")
+        self.progress_value.show()
+        self._append_agent("开始执行。")
         worker = ExecutionWorker(
             plan=plan,
             registry_path=self._registry_path,
@@ -587,17 +555,10 @@ class MainWindow(QMainWindow):
 
     def _execution_finished(self) -> None:
         self._execution_worker = None
-        self.plan_button.setEnabled(True)
-        self.session_combo.setEnabled(True)
-        self.manage_sessions_button.setEnabled(True)
-        self.plugins_button.setEnabled(True)
-        self.model_button.setEnabled(True)
-        self.message_input.setEnabled(True)
-        self.attach_button.setEnabled(True)
-        self.remove_attachment_button.setEnabled(True)
+        if self._plan_worker is None:
+            self._set_planning(False)
         self.cancel_button.hide()
         self.cancel_button.setEnabled(True)
-        self.execute_button.setText("确认并执行计划")
 
     def manage_sessions(self) -> None:
         if (
@@ -674,8 +635,6 @@ class MainWindow(QMainWindow):
         self._llm_settings = selected
         self._router = self._new_router()
         self._pending_plan = None
-        self.execute_button.setEnabled(False)
-        self.execute_button.setText("确认并执行计划")
         self._refresh_model_button()
         self._append_agent(
             f"模型来源已切换为 {selected.display_name}。后续规划、执行和媒体分析都会使用此配置。"
@@ -722,8 +681,6 @@ class MainWindow(QMainWindow):
         self._conversation_id = f"conversation-{uuid.uuid4().hex}"
         self._router = self._new_router()
         self.clear_attachments()
-        self.execute_button.setEnabled(False)
-        self.execute_button.setText("确认并执行计划")
         self.progress_frame.hide()
         self._append_agent("新会话已开始。请选择执行会话并描述任务。")
 
@@ -744,7 +701,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_result.output_directories[0]))
 
     def _set_planning(self, planning: bool) -> None:
-        self.plan_button.setEnabled(not planning)
+        self.send_button.setEnabled(not planning)
         self.session_combo.setEnabled(not planning)
         self.manage_sessions_button.setEnabled(not planning)
         self.plugins_button.setEnabled(not planning)
@@ -752,7 +709,16 @@ class MainWindow(QMainWindow):
         self.message_input.setEnabled(not planning)
         self.attach_button.setEnabled(not planning)
         self.remove_attachment_button.setEnabled(not planning)
-        self.plan_button.setText("正在生成计划…" if planning else "生成计划  →")
+        self.send_button.setText("处理中…" if planning else "发送")
+        if planning:
+            self.progress_frame.show()
+            self.progress_label.setText("正在理解任务…")
+            self.progress_bar.setRange(0, 0)
+            self.progress_value.hide()
+        elif self._execution_worker is None:
+            self.progress_frame.hide()
+            self.progress_bar.setRange(0, 100)
+            self.progress_value.show()
 
     def _append_user(self, message: str, *, attachments: list[Path] | None = None) -> None:
         attached = ""
@@ -802,8 +768,7 @@ QListView#comboPopup::item { min-height: 42px; padding: 0 14px; }
 QListView#comboPopup::item:hover { background: #303641; }
 QListView#comboPopup::item:selected { background: #3a4250; color: #d8ff52; }
 QPushButton { min-height: 38px; padding: 0 15px; border-radius: 9px; font-weight: 700; }
-QPushButton#primaryButton, QPushButton#executeButton { background: #d8ff52; color: #15170c; border: none; }
-QPushButton#executeButton { background: #b7d943; }
+QPushButton#primaryButton { background: #d8ff52; color: #15170c; border: none; }
 QPushButton#secondaryButton { background: #242832; color: #d8dae0; border: 1px solid #3a3f4b; }
 QPushButton:disabled { background: #292c33; color: #686d77; }
 QProgressBar { min-height: 7px; max-height: 7px; border: none; border-radius: 3px; background: #30343d; }

@@ -26,7 +26,7 @@ class ExecutionPolicy:
     max_browse_items: int = 100
     max_download_urls_per_call: int = 20
     max_total_download_mb: int = 5_000
-    max_tool_calls: int = 20
+    max_tool_calls: int = 200
 
     def validate_message(self, message: str) -> None:
         forbidden = ("点赞", "评论", "关注", "转发", "私信", "自动登录")
