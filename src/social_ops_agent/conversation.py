@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .contracts import AgentExecutionResult, AgentPlan, DynamicAgentPlan
+from .task_store import TaskStore
 
 
 TurnStatus = Literal[
@@ -17,6 +18,7 @@ TurnStatus = Literal[
     "executing",
     "succeeded",
     "failed",
+    "partial",
     "cancelled",
 ]
 
@@ -34,6 +36,7 @@ class ConversationTurn(BaseModel):
     result: dict | None = None
     error_stage: Literal["planning", "execution", "interrupted"] | None = None
     error: str | None = Field(default=None, max_length=20_000)
+    publish_attempted: bool = False
     created_at: str
     updated_at: str
 
@@ -49,12 +52,16 @@ class ConversationSnapshot(BaseModel):
 
 
 class ConversationCoordinator:
-    """Single durable owner of GUI turns and Harness conversation identity."""
+    """GUI transcript and compact model context; TaskStore owns execution facts."""
 
     def __init__(self, state_root: Path) -> None:
         self.state_root = state_root.expanduser().resolve()
         self.path = self.state_root / "conversations" / "active.json"
+        self.task_store = TaskStore(self.state_root)
         self.snapshot = self._load() or self._fresh_snapshot()
+        for turn in self.snapshot.turns:
+            self.task_store.import_turn(self.conversation_id, turn.model_dump(mode="json"))
+            self._sync_execution(turn)
         if self._recover_interrupted_turn():
             self._save()
         elif not self.path.is_file():
@@ -97,6 +104,7 @@ class ConversationCoordinator:
         )
         if len(self.snapshot.turns) > 200:
             self.snapshot.turns = self.snapshot.turns[-200:]
+        self.task_store.ensure_task(self.conversation_id, message, turn_id)
         self._save()
         return turn_id
 
@@ -104,6 +112,9 @@ class ConversationCoordinator:
         turn = self._turn(turn_id)
         turn.status = "planned"
         turn.plan = _plan_payload(plan)
+        if isinstance(plan, DynamicAgentPlan):
+            turn.session_ref = plan.session_ref
+            turn.platform = plan.platform
         turn.error_stage = None
         turn.error = None
         self._touch(turn)
@@ -113,9 +124,18 @@ class ConversationCoordinator:
         turn.status = "executing"
         self._touch(turn)
 
+    def mark_publish_attempted(self, turn_id: str) -> None:
+        turn = self._turn(turn_id)
+        turn.publish_attempted = True
+        self._touch(turn)
+
     def mark_succeeded(self, turn_id: str, result: AgentExecutionResult) -> None:
         turn = self._turn(turn_id)
-        turn.status = "cancelled" if result.cancelled else "succeeded"
+        turn.status = (
+            "cancelled" if result.cancelled
+            else "succeeded" if result.completion_status == "completed"
+            else result.completion_status
+        )
         turn.result = _result_payload(result)
         turn.error_stage = None
         turn.error = None
@@ -142,38 +162,7 @@ class ConversationCoordinator:
         self._touch(turn)
 
     def context_for_next_turn(self) -> str | None:
-        if not self.snapshot.turns:
-            return None
-        rows: list[dict[str, object]] = []
-        for turn in reversed(self.snapshot.turns):
-            plan_summary = None
-            if isinstance(turn.plan, dict):
-                plan_summary = turn.plan.get("summary") or turn.plan.get("objective")
-            result_summary = None
-            if isinstance(turn.result, dict):
-                result_summary = turn.result.get("summary")
-            row = {
-                "user_message": _excerpt(turn.user_message, 1_500),
-                "status": turn.status,
-                "plan_summary": _excerpt(plan_summary, 1_000),
-                "result_summary": _excerpt(result_summary, 2_000),
-                "error_stage": turn.error_stage,
-                "error": _excerpt(turn.error, 2_000),
-            }
-            candidate = [row, *rows]
-            encoded = json.dumps(
-                {"recent_turns": candidate},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            if len(encoded) > 20_000 and rows:
-                break
-            rows = candidate
-        return json.dumps(
-            {"recent_turns": rows},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        return self.task_store.model_context(self.conversation_id)
 
     def last_result(self) -> AgentExecutionResult | None:
         for turn in reversed(self.snapshot.turns):
@@ -196,10 +185,12 @@ class ConversationCoordinator:
         for turn in self.snapshot.turns:
             if turn.status not in {"planning", "planned", "executing"}:
                 continue
+            self.task_store.recover_interrupted(turn.turn_id)
             turn.status = "failed"
             turn.error_stage = "interrupted"
             turn.error = "应用在该任务完成前退出；可以发送“重试”继续上一任务。"
             turn.updated_at = _timestamp()
+            self.task_store.import_turn(self.conversation_id, turn.model_dump(mode="json"))
             changed = True
         return changed
 
@@ -211,7 +202,30 @@ class ConversationCoordinator:
 
     def _touch(self, turn: ConversationTurn) -> None:
         turn.updated_at = _timestamp()
+        self.task_store.import_turn(self.conversation_id, turn.model_dump(mode="json"))
+        self._sync_execution(turn)
         self._save()
+
+    def _sync_execution(self, turn: ConversationTurn) -> None:
+        report = self.task_store.execution(turn.turn_id)
+        if not report:
+            return
+        turn.publish_attempted = turn.publish_attempted or report["publish_attempted"]
+        if report["state"] == "executing" or not turn.plan:
+            return
+        turn.status = report["state"]
+        if "summary" in report:
+            turn.result = AgentExecutionResult(
+                runtime="deepseek_harness", plan=turn.plan,
+                **{key: value for key, value in report.items()
+                   if key in {"summary", "warnings", "tool_calls", "completed_steps", "total_steps",
+                              "completion_status", "publish_state", "cancelled", "finish_reason"}},
+            ).model_dump(mode="json")
+            turn.error_stage = None
+            turn.error = None
+        if report.get("error"):
+            turn.error_stage = "execution"
+            turn.error = report["error"]
 
     def _load(self) -> ConversationSnapshot | None:
         try:
@@ -246,12 +260,6 @@ class ConversationCoordinator:
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _excerpt(value: object, limit: int) -> str | None:
-    if value is None:
-        return None
-    return str(value)[:limit]
 
 
 def _plan_payload(plan: AgentPlan | DynamicAgentPlan) -> dict:

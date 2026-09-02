@@ -411,7 +411,13 @@ class PluginInvoker:
             )
         return catalog
 
-    def launch_gui(self, plugin_id: str, extra_args: list[str] | None = None) -> subprocess.Popen[bytes]:
+    def launch_gui(
+        self,
+        plugin_id: str,
+        extra_args: list[str] | None = None,
+        *,
+        ready_file: Path | None = None,
+    ) -> subprocess.Popen[bytes]:
         record = self.manager.get(plugin_id, require_enabled=True)
         module = record.manifest.runtime.gui_module
         if not module:
@@ -434,6 +440,11 @@ class PluginInvoker:
         ):
             environment.pop(name, None)
         environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        # A unique per-launch path lets the child acknowledge an exposed window.
+        # Never propagate an unrelated parent GUI's readiness channel.
+        environment.pop("SOCIAL_AGENT_GUI_READY_FILE", None)
+        if ready_file is not None:
+            environment["SOCIAL_AGENT_GUI_READY_FILE"] = str(ready_file.resolve())
         try:
             return subprocess.Popen(
                 [str(record.python), "-m", module, *(extra_args or [])],

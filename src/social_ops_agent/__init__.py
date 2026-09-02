@@ -9,6 +9,7 @@ from .contracts import (
     AgentSource,
     AgentView,
     AttachmentModality,
+    BrowserSessionBinding,
     DynamicAgentPlan,
     RuntimeHealth,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "AgentSource",
     "AgentView",
     "AttachmentModality",
+    "BrowserSessionBinding",
     "AgentRuntime",
     "ConversationalPlanner",
     "ConversationCoordinator",

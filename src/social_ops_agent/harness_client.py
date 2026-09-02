@@ -299,12 +299,74 @@ def _final_response(events: list[JsonObject]) -> str:
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
-        return "".join(
+        text = "".join(
             str(block.get("text") or "")
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
         )
+        if text.strip():
+            return text
+    # Some providers emit a complete block-end and then fail during final
+    # context accounting/compaction before Harness appends assistant/message.
+    for event in reversed(events):
+        if event.get("type") != "assistant/chunk":
+            continue
+        data = event.get("data")
+        chunk = data.get("chunk") if isinstance(data, dict) else None
+        block = chunk.get("block") if isinstance(chunk, dict) else None
+        if (
+            isinstance(chunk, dict)
+            and chunk.get("type") == "block-end"
+            and isinstance(block, dict)
+            and block.get("type") == "text"
+        ):
+            text = str(block.get("text") or "")
+            if text.strip():
+                return text
     return ""
+
+
+def recover_logged_final_response(session_root: Path, session_id: str) -> str:
+    """Recover a final assistant message persisted before a late Harness error."""
+    events = _read_session_events(session_root, session_id)
+    return _final_response(events)
+
+
+def recover_logged_turn_error(session_root: Path, session_id: str) -> str:
+    events = _read_session_events(session_root, session_id)
+    for event in reversed(events):
+        if event.get("type") != "turn/end":
+            continue
+        data = event.get("data")
+        reason = data.get("reason") if isinstance(data, dict) else None
+        error = reason.get("error") if isinstance(reason, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return ""
+
+
+def _read_session_events(session_root: Path, session_id: str) -> list[JsonObject]:
+    candidates = [
+        path
+        for path in session_root.rglob("session.jsonl")
+        if path.parent.name == session_id
+    ]
+    if not candidates:
+        return []
+    session_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    events: list[JsonObject] = []
+    try:
+        for line in session_path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    except OSError:
+        return []
+    return events
 
 
 def _finish_reason(events: list[JsonObject]) -> str | None:

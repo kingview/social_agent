@@ -10,11 +10,22 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .contracts import AgentAttachment, AgentProgress, DynamicAgentPlan
+from .contracts import (
+    AgentAttachment,
+    AgentProgress,
+    BrowserSessionBinding,
+    DynamicAgentPlan,
+)
 from .execution_policy_channel import ExecutionPolicyChannel
-from .harness_client import HarnessError, HarnessJsonRpcClient
+from .execution_tracking import ExecutionTracker
+from .harness_client import (
+    HarnessError,
+    HarnessJsonRpcClient,
+    recover_logged_final_response,
+    recover_logged_turn_error,
+)
 from .harness_prompts import (
     content_blocks,
     execution_persona,
@@ -25,8 +36,10 @@ from .harness_prompts import (
 )
 from .planner import SelectedSession, requested_download_limit
 from .plugins import default_plugin_root
-from .policy import DEFAULT_EXECUTION_POLICY, ExecutionPolicy, requested_write_actions
+from .policy import DEFAULT_EXECUTION_POLICY, ExecutionPolicy
 from .settings import LLMSettings
+from .task_intent import resolve_write_actions
+from .task_store import TaskRecord, TaskStore
 
 
 HARNESS_VERSION = "0.1.1-rc.2 + native-image compatibility"
@@ -37,8 +50,21 @@ class HarnessExecutionResult(BaseModel):
     response: str
     session_id: str
     tool_calls: list[str]
+    warnings: list[str] = Field(default_factory=list)
     finish_reason: str | None = None
     cancelled: bool = False
+    completion_status: Literal["completed", "partial", "failed"] = "completed"
+    completed_steps: int = 0
+    total_steps: int = 0
+    publish_state: Literal["not_requested", "not_attempted", "published", "failed", "unknown"] = "not_requested"
+
+    def user_summary(self) -> str:
+        summary = self.response or "执行结束，但模型没有返回文字总结。"
+        if self.completion_status != "completed":
+            summary = (f"任务未全部完成：实际完成 {self.completed_steps}/{self.total_steps} 步。\n"
+                       + "\n".join(self.warnings)
+                       + "\n\n模型总结（完成状态以工具核验结果为准）：\n" + summary)
+        return summary
 
 
 class DeepSeekHarnessBackend:
@@ -59,6 +85,7 @@ class DeepSeekHarnessBackend:
         self.settings = settings or LLMSettings.from_env()
         self.policy = policy
         self.state_root = self.output_root / ".social-agent-state"
+        self.task_store = TaskStore(self.state_root)
         self.session_root = self.state_root / "harness-sessions"
         policy_name = re.sub(r"[^A-Za-z0-9_.-]", "_", self.conversation_id)
         self.execution_policy_path = (
@@ -84,13 +111,36 @@ class DeepSeekHarnessBackend:
         return True, f"DeepSeek Harness {HARNESS_VERSION} · {node}"
 
     def propose(
+        self, message: str, session: SelectedSession | None, *,
+        available_sessions: tuple[SelectedSession, ...] = (),
+        attachments: tuple[AgentAttachment, ...] = (), media_context: str | None = None,
+        context_summary: str | None = None, task_id: str | None = None,
+    ) -> DynamicAgentPlan:
+        task_id = self.task_store.ensure_task(self.conversation_id, message, task_id)
+        history = self.task_store.history(self.conversation_id, exclude=task_id)
+        try:
+            plan = self._propose(
+                message, session, available_sessions=available_sessions, attachments=attachments,
+                media_context=media_context,
+                context_summary=context_summary or self.task_store.model_context(self.conversation_id, exclude=task_id),
+                task_history=history,
+            ).model_copy(update={"task_id": task_id})
+        except BaseException as exc:
+            self.task_store.planning_failed(task_id, str(exc))
+            raise
+        self.task_store.set_plan(task_id, plan.model_dump(mode="json"))
+        return plan
+
+    def _propose(
         self,
         message: str,
         session: SelectedSession | None,
         *,
+        available_sessions: tuple[SelectedSession, ...] = (),
         attachments: tuple[AgentAttachment, ...] = (),
         media_context: str | None = None,
         context_summary: str | None = None,
+        task_history: tuple[TaskRecord, ...] = (),
     ) -> DynamicAgentPlan:
         self.policy.validate_message(message)
         client = self._start_client(mode="plan")
@@ -102,6 +152,7 @@ class DeepSeekHarnessBackend:
             prompt = planning_prompt(
                 message,
                 session,
+                available_sessions=available_sessions,
                 attachments=attachments,
                 media_context=media_context,
                 context_summary=context_summary,
@@ -115,26 +166,37 @@ class DeepSeekHarnessBackend:
                     _json_object(first_turn.final_response),
                     message=message,
                     session=session,
+                    available_sessions=available_sessions,
                     attachments=attachments,
                     media_context=media_context,
                     max_tool_calls=self.policy.max_tool_calls,
+                    context_summary=context_summary,
+                    task_history=task_history,
+                    require_step_tools=True,
                 )
-            except (HarnessError, ValidationError):
+            except (HarnessError, ValidationError) as exc:
                 repair_turn = client.run_turn(
                     session_id=plan_session_id,
                     prompt=planning_repair_prompt(
                         message,
                         session,
                         first_turn.final_response,
+                        available_sessions=available_sessions,
+                        context_summary=context_summary,
+                        validation_error=str(exc),
                     ),
                 )
                 return _validated_dynamic_plan(
                     _json_object(repair_turn.final_response),
                     message=message,
                     session=session,
+                    available_sessions=available_sessions,
                     attachments=attachments,
                     media_context=media_context,
                     max_tool_calls=self.policy.max_tool_calls,
+                    context_summary=context_summary,
+                    require_step_tools=True,
+                    task_history=task_history,
                 )
         finally:
             self._active_client = None
@@ -147,20 +209,73 @@ class DeepSeekHarnessBackend:
         return model_available, f"{harness_detail}；{model_detail}"
 
     def execute(
+        self, plan: DynamicAgentPlan, *,
+        progress: Callable[[AgentProgress], None] | None = None,
+    ) -> HarnessExecutionResult:
+        self.policy.validate_plan(plan)
+        task_id = self.task_store.ensure_task(self.conversation_id, plan.objective, plan.task_id)
+        # Recheck lineage at execution time, not only at planning time.
+        resolve_write_actions(plan.model_dump(), plan.objective,
+                              self.task_store.history(self.conversation_id, exclude=task_id))
+        plan = plan.model_copy(update={"task_id": task_id})
+        self.task_store.set_plan(task_id, plan.model_dump(mode="json"))
+        execution_id = secrets.token_urlsafe(18)
+        self.task_store.start(task_id, execution_id)
+        tracker = ExecutionTracker(plan)
+
+        def notify(event: AgentProgress) -> None:
+            self.task_store.checkpoint(task_id, execution_id, tracker.report())
+            if progress is not None:
+                progress(event)
+
+        try:
+            result = self._execute(plan, execution_id=execution_id, tracker=tracker, progress=notify)
+            state = "succeeded" if result.completion_status == "completed" else result.completion_status
+            self.task_store.checkpoint(task_id, execution_id,
+                {**tracker.report(), "summary": result.user_summary(), "warnings": result.warnings,
+                 "completion_status": result.completion_status, "finish_reason": result.finish_reason}, state=state)
+            return result
+        except BaseException as exc:
+            self.task_store.checkpoint(task_id, execution_id,
+                {**tracker.report(), "error": str(exc),
+                 "completion_status": "partial" if tracker.completed else "failed"},
+                state="partial" if tracker.completed else "failed")
+            raise
+        finally:
+            self._active_client = None
+            self.execution_policy_channel.revoke(execution_id)
+            if plan.write_actions:
+                self._drop_client("execute")
+
+    def _execute(
         self,
         plan: DynamicAgentPlan,
         *,
+        execution_id: str,
+        tracker: ExecutionTracker,
         progress: Callable[[AgentProgress], None] | None = None,
     ) -> HarnessExecutionResult:
         self.policy.validate_plan(plan)
         notify = progress or (lambda _event: None)
-        notify(AgentProgress(stage="harness", completed=0, total=1, message="Harness 正在规划并调用 Tools…"))
+        total_steps = len(plan.steps)
+        notify(
+            AgentProgress(
+                stage="step",
+                completed=0,
+                total=total_steps,
+                message=f"准备执行，共 {total_steps} 步。",
+            )
+        )
         write_actions = tuple(plan.write_actions)
         approval_token = secrets.token_urlsafe(32) if write_actions == ("publish_x",) else None
-        execution_id = secrets.token_urlsafe(18)
         self.execution_policy_channel.grant(
             execution_id,
             max_download_posts=plan.max_download_posts,
+            allowed_session_refs=[
+                item.session_ref for item in plan.authorized_browser_sessions()
+            ],
+            task_id=plan.task_id,
+            steps=plan.execution_steps(),
         )
         if approval_token:
             # X publishing keeps its stronger one-shot process isolation.
@@ -183,24 +298,9 @@ class DeepSeekHarnessBackend:
                     raise HarnessError(
                         f"Harness exceeded the approved Tool call budget ({plan.max_tool_calls})."
                     )
-                name = str(data.get("name") or "Tool")
-                notify(
-                    AgentProgress(
-                        stage="tool",
-                        completed=0,
-                        total=1,
-                        message=f"Harness 正在调用 {name}（第 {tool_count} 次）…",
-                    )
-                )
-            elif event_type == "tool/result":
-                notify(
-                    AgentProgress(
-                        stage="tool",
-                        completed=0,
-                        total=1,
-                        message=f"第 {tool_count} 次 Tool 调用完成，Harness 正在决定下一步…",
-                    )
-                )
+                notify(tracker.called(data))
+            elif event_type == "tool/result" and isinstance(data, dict):
+                notify(tracker.returned(data))
 
         try:
             execution_session_id = (
@@ -224,6 +324,27 @@ class DeepSeekHarnessBackend:
                 on_event=on_event,
             )
             response = turn.final_response.strip()
+            warnings: list[str] = []
+            if not response:
+                response = recover_logged_final_response(
+                    self.session_root / "execute",
+                    execution_session_id,
+                ).strip()
+                if response:
+                    warnings.append(
+                        "Harness 在最终文本生成后异常结束；已从本地会话日志恢复完整结果。"
+                    )
+            if response and turn.finish_reason == "error":
+                failure = recover_logged_turn_error(
+                    self.session_root / "execute",
+                    execution_session_id,
+                )
+                warnings.append(
+                    "模型在生成最终结果后报告错误"
+                    f"{f'：{failure}' if failure else ''}；结果已保留，执行会话已重置。"
+                )
+                self._drop_client("execute")
+                self._execute_generation += 1
             if not response:
                 # An idle turn with no assistant message is not a successful task.
                 # Discard only the broken execution process so the next user retry
@@ -232,16 +353,32 @@ class DeepSeekHarnessBackend:
                 self._drop_client("execute")
                 self._execute_generation += 1
                 raise HarnessError(
-                    "Execution Harness ended without an assistant response; "
-                    "the execution session was reset and the task can be retried."
+                    "Execution Harness 未返回最终总结；执行会话已重置，请重试。"
                 )
-            notify(AgentProgress(stage="done", completed=1, total=1, message="Harness 动态任务执行完成。"))
+            final_progress = tracker.finish(normal_end=turn.finish_reason not in {"error", "cancelled", "interrupted"})
+            completion_status = (
+                "completed" if final_progress.stage == "done"
+                else "partial" if tracker.completed else "failed"
+            )
+            if completion_status != "completed":
+                warnings.append("未完成步骤：" + "；".join(tracker.unfinished()))
+                if plan.write_actions and tracker.publish_state != "published":
+                    warnings.append(
+                        "X 发布未执行。" if tracker.publish_state == "not_attempted"
+                        else "X 发布未获成功确认，不能自动重试，请先核对账号。"
+                    )
+            notify(final_progress)
             return HarnessExecutionResult(
                 plan=plan,
                 response=response,
                 session_id=turn.session_id,
-                tool_calls=turn.tool_calls,
+                tool_calls=tracker.tool_calls or turn.tool_calls,
+                warnings=list(dict.fromkeys(warnings)),
                 finish_reason=turn.finish_reason,
+                completion_status=completion_status,
+                completed_steps=len(tracker.completed),
+                total_steps=total_steps,
+                publish_state=tracker.publish_state,
             )
         finally:
             self._active_client = None
@@ -335,16 +472,42 @@ def requires_dynamic_harness(message: str) -> bool:
     return bool(message.strip())
 
 
+def _tool_label(name: str) -> str:
+    labels = {
+        "mcp__social__browse_posts": "正在搜索并读取帖子",
+        "mcp__social__browser_operate": "正在操作浏览器",
+        "mcp__social__download_media": "正在下载帖子内容",
+        "mcp__social__analyze_content": "正在分析图片、视频和文本",
+        "mcp__social__process_watermark": "正在检测并处理水印",
+        "mcp__social__generate_post_copy": "正在生成文案",
+        "mcp__social__publish_x_post": "正在发布到 X",
+    }
+    return labels.get(name, f"正在调用 {name}")
+
+
 def _validated_dynamic_plan(
     payload: dict[str, Any],
     *,
     message: str,
     session: SelectedSession | None,
+    available_sessions: tuple[SelectedSession, ...] = (),
     attachments: tuple[AgentAttachment, ...],
     media_context: str | None,
     max_tool_calls: int,
+    context_summary: str | None = None,
+    require_step_tools: bool = False,
+    task_history: tuple[TaskRecord, ...] = (),
 ) -> DynamicAgentPlan:
-    write_actions = list(requested_write_actions(message))
+    write_actions, resume_turn_id = resolve_write_actions(payload, message, task_history)
+    step_tools = payload.get("step_tools", [])
+    if require_step_tools and (
+        not isinstance(step_tools, list)
+        or len(step_tools) != len(payload.get("steps", []))
+        or not step_tools
+    ):
+        raise HarnessError("step_tools 必须与 steps 一一对应。")
+    if step_tools and ("publish_x_post" in step_tools) != bool(write_actions):
+        raise HarnessError("发布步骤与用户授权不一致；继续历史任务时必须提供 resume_turn_id 和 write_actions。")
     explicit_download_limit = requested_download_limit(message)
     model_download_limit = payload.get("max_download_posts")
     max_download_posts = (
@@ -352,21 +515,152 @@ def _validated_dynamic_plan(
         if explicit_download_limit is not None
         else model_download_limit
     )
+    selected_sessions = _select_browser_sessions(
+        payload,
+        message=message,
+        manual_session=session,
+        available_sessions=available_sessions,
+    )
+    primary = selected_sessions[0] if selected_sessions else None
     return DynamicAgentPlan.model_validate(
         {
             "mode": "dynamic_harness",
             "objective": message,
-            "platform": session.platform if session else None,
-            "session_ref": session.session_ref if session else None,
+            "platform": primary.platform if primary else None,
+            "session_ref": primary.session_ref if primary else None,
+            "browser_sessions": selected_sessions,
             "summary": payload.get("summary"),
             "steps": payload.get("steps"),
+            "step_tools": step_tools,
+            "step_units": payload.get("step_units", []),
+            "resume_turn_id": resume_turn_id,
             "attachments": list(attachments),
             "media_context": media_context,
             "max_download_posts": max_download_posts,
             "write_actions": write_actions,
             "max_tool_calls": min(20, max_tool_calls),
-            "requires_confirmation": bool(write_actions),
+            "requires_confirmation": False,
         }
+    )
+
+
+def _select_browser_sessions(
+    payload: dict[str, Any],
+    *,
+    message: str,
+    manual_session: SelectedSession | None,
+    available_sessions: tuple[SelectedSession, ...],
+) -> list[BrowserSessionBinding]:
+    """Resolve model choices only against the local session registry snapshot."""
+    candidates = _unique_sessions(
+        (manual_session,) if manual_session is not None else available_sessions
+    )
+    if manual_session is not None:
+        selected = [manual_session]
+    else:
+        raw_refs = payload.get("session_refs", payload.get("selected_session_refs", []))
+        if raw_refs is None:
+            raw_refs = []
+        if isinstance(raw_refs, str):
+            raw_refs = [raw_refs]
+        if not isinstance(raw_refs, list) or any(not isinstance(item, str) for item in raw_refs):
+            raise HarnessError("planning response session_refs must be a string array")
+        by_ref = {item.session_ref: item for item in candidates}
+        unknown = [item for item in raw_refs if item not in by_ref]
+        if unknown:
+            raise HarnessError("planning response selected an unregistered browser session")
+        selected = _unique_sessions(tuple(by_ref[item] for item in raw_refs))
+
+        # Models occasionally omit a required platform even though it is explicit
+        # in the command. Fill only from the trusted local candidate list.
+        selected_platforms = {item.platform for item in selected}
+        for platform in _mentioned_platforms(message):
+            if platform in selected_platforms:
+                continue
+            inferred = _preferred_session(message, candidates, platform)
+            if inferred is not None:
+                selected.append(inferred)
+                selected_platforms.add(platform)
+
+        if not selected and len(candidates) == 1 and _looks_like_browser_task(message):
+            selected = [candidates[0]]
+
+    return [
+        BrowserSessionBinding(
+            session_ref=item.session_ref,
+            platform=item.platform,
+            profile_name=getattr(item, "profile_name", ""),
+        )
+        for item in selected
+    ]
+
+
+def _unique_sessions(sessions: tuple[SelectedSession, ...]) -> list[SelectedSession]:
+    seen: set[str] = set()
+    unique: list[SelectedSession] = []
+    for item in sessions:
+        if item.session_ref in seen:
+            continue
+        seen.add(item.session_ref)
+        unique.append(item)
+    return unique
+
+
+def _mentioned_platforms(message: str) -> list[str]:
+    patterns = {
+        "douyin": r"抖音|douyin(?:\.com)?",
+        "xiaohongshu": r"小红书|xiaohongshu|xhs(?:link)?",
+        "telegram": r"telegram|电报|t\.me",
+        "x": r"twitter|推特|x\.com|(?<![A-Za-z])x(?![A-Za-z])",
+    }
+    matches: list[tuple[int, str]] = []
+    for platform, pattern in patterns.items():
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            matches.append((match.start(), platform))
+    return [platform for _, platform in sorted(matches)]
+
+
+def _preferred_session(
+    message: str,
+    candidates: list[SelectedSession],
+    platform: str,
+) -> SelectedSession | None:
+    platform_sessions = [item for item in candidates if item.platform == platform]
+    if not platform_sessions:
+        return None
+    normalized_message = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", message).casefold()
+    named = [
+        item
+        for item in platform_sessions
+        if item.profile_name
+        and re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", item.profile_name).casefold()
+        in normalized_message
+    ]
+    if named:
+        return named[0]
+    requested_numbers = set(re.findall(r"(?:窗口|账号|profile)\s*0*(\d+)", message, re.IGNORECASE))
+    if requested_numbers:
+        for item in platform_sessions:
+            if requested_numbers.intersection(re.findall(r"\d+", item.profile_name)):
+                return item
+    return platform_sessions[0]
+
+
+def _looks_like_browser_task(message: str) -> bool:
+    return any(
+        word in message.casefold()
+        for word in (
+            "搜索",
+            "浏览",
+            "帖子",
+            "下载",
+            "频道",
+            "发布",
+            "打开网页",
+            "timeline",
+            "feed",
+        )
     )
 
 

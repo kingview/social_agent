@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, QThread, QTimer, QUrl, Signal
@@ -37,6 +39,7 @@ from .settings import LLMSettings, LLMSettingsError, LLMSettingsStore
 
 
 APP_NAME = "Social Agent"
+AUTO_SESSION_REF = "__auto_browser_session__"
 PLATFORM_LABELS = {
     "douyin": "抖音",
     "xiaohongshu": "小红书",
@@ -55,6 +58,7 @@ class PlanWorker(QThread):
         *,
         message: str,
         session: SelectedSession | None,
+        available_sessions: tuple[SelectedSession, ...],
         attachment_paths: list[Path],
         context_summary: str | None,
         conversation_id: str,
@@ -62,11 +66,13 @@ class PlanWorker(QThread):
         output_root: Path,
         plugin_root: Path,
         router: RuntimeRouter,
+        task_id: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._message = message
         self._session = session
+        self._available_sessions = available_sessions
         self._attachment_paths = list(attachment_paths)
         self._context_summary = context_summary
         self._conversation_id = conversation_id
@@ -74,9 +80,14 @@ class PlanWorker(QThread):
         self._output_root = output_root
         self._plugin_root = plugin_root
         self._router = router
+        self._task_id = task_id
 
     def run(self) -> None:
         try:
+            if self._session is None and self._available_sessions:
+                self.status_changed.emit(
+                    f"正在根据任务从 {len(self._available_sessions)} 个比特浏览器窗口中自动选择…"
+                )
             if self._attachment_paths:
                 self.status_changed.emit("正在解析附件；视频和音频可能需要几分钟…")
             prepared = prepare_multimodal_input(
@@ -92,9 +103,11 @@ class PlanWorker(QThread):
             plan = self._router.propose(
                 self._message,
                 self._session,
+                available_sessions=self._available_sessions,
                 attachments=prepared.attachments,
                 media_context=prepared.media_context,
                 context_summary=self._context_summary,
+                task_id=self._task_id,
             )
         except (PlanningError, MultimodalInputError) as exc:
             self.failed.emit(str(exc))
@@ -188,8 +201,11 @@ class MainWindow(QMainWindow):
         self._pending_plan: RuntimePlan | None = None
         self._last_result = self._conversation.last_result()
         self._active_turn_id: str | None = None
+        self._last_progress_message = ""
         self._attachment_paths: list[Path] = []
         self._session_manager_process = None
+        self._session_manager_ready_dir = None
+        self._session_manager_started_at = 0.0
         self._session_manager_timer = QTimer(self)
         self._session_manager_timer.setInterval(500)
         self._session_manager_timer.timeout.connect(self._poll_session_manager)
@@ -245,7 +261,7 @@ class MainWindow(QMainWindow):
         session_label.setObjectName("fieldLabel")
         self.session_combo = UniformComboBox()
         self.session_combo.setObjectName("control")
-        self.manage_sessions_button = QPushButton("管理比特浏览器会话")
+        self.manage_sessions_button = QPushButton("管理浏览器窗口")
         self.manage_sessions_button.setObjectName("secondaryButton")
         self.manage_sessions_button.clicked.connect(self.manage_sessions)
         session_layout.addWidget(session_label)
@@ -325,7 +341,7 @@ class MainWindow(QMainWindow):
             self._restore_conversation()
         else:
             self._append_agent(
-                "可以直接添加图片、视频或音频并描述需求；需要浏览社媒时，再选择一个已经在比特浏览器中手动登录的会话。"
+                "可以直接添加图片、视频或音频并描述需求；需要浏览社媒时，Agent 会根据任务自动选择已经在比特浏览器中登录的窗口。"
                 "图片使用 Harness 原生多模态；视频音频先提取内容，再与文字和会话历史一起理解。"
             )
         if self._settings_load_error:
@@ -415,17 +431,18 @@ class MainWindow(QMainWindow):
 
     def send_message(self) -> None:
         record = self._selected_record()
+        records = self._registry.list()
         message = self.message_input.toPlainText().strip()
         attachments = list(self._attachment_paths)
         if not message and attachments:
             message = "请理解并分析这些附件，根据附件内容完成合适的本地任务。"
         if not message:
             return
-        if record is None and not attachments:
+        if not records and not attachments:
             QMessageBox.warning(
                 self,
                 "缺少输入",
-                "请添加图片、视频或音频；如需浏览社媒平台，还要选择登录会话。",
+                "请添加图片、视频或音频；如需浏览社媒平台，还要先注册登录会话。",
             )
             return
         if not self._ensure_llm_secret():
@@ -438,6 +455,7 @@ class MainWindow(QMainWindow):
             platform=record.platform if record is not None else None,
         )
         self._append_user(message, attachments=attachments)
+        self._last_progress_message = ""
         self.message_input.clear()
         self._set_planning(True)
         session = (
@@ -449,9 +467,18 @@ class MainWindow(QMainWindow):
             if record is not None
             else None
         )
+        available_sessions = tuple(
+            SelectedSession(
+                session_ref=item.session_ref,
+                platform=item.platform,
+                profile_name=item.profile_name,
+            )
+            for item in records
+        )
         worker = PlanWorker(
             message=message,
             session=session,
+            available_sessions=available_sessions,
             attachment_paths=attachments,
             context_summary=context_summary,
             conversation_id=self._conversation_id,
@@ -459,6 +486,7 @@ class MainWindow(QMainWindow):
             output_root=self._output_root,
             plugin_root=self._plugin_manager.root,
             router=self._router,
+            task_id=self._active_turn_id,
             parent=self,
         )
         worker.status_changed.connect(self._planning_status)
@@ -489,6 +517,20 @@ class MainWindow(QMainWindow):
         self._pending_plan = plan
         if self._active_turn_id is not None:
             self._conversation.mark_planned(self._active_turn_id, plan)
+        if isinstance(plan, DynamicAgentPlan):
+            selected_sessions = plan.authorized_browser_sessions()
+            if selected_sessions:
+                selected = "、".join(
+                    f"{PLATFORM_LABELS.get(item.platform, item.platform)} · "
+                    f"{item.profile_name or item.session_ref}"
+                    for item in selected_sessions
+                )
+                mode = "自动选择" if self.session_combo.currentData() == AUTO_SESSION_REF else "使用"
+                self._append_agent(f"已{mode}比特浏览器窗口：{selected}")
+            steps = "\n".join(
+                f"{index}. {step}" for index, step in enumerate(plan.steps, start=1)
+            )
+            self._append_agent(f"执行计划（共 {len(plan.steps)} 步）：\n{steps}")
         self.execute_plan()
 
     def _plan_failed(self, message: str) -> None:
@@ -503,6 +545,7 @@ class MainWindow(QMainWindow):
 
     def _planning_status(self, message: str) -> None:
         self.progress_label.setText(message)
+        self._append_progress_message(message)
 
     def _planning_finished(self) -> None:
         self._plan_worker = None
@@ -513,26 +556,6 @@ class MainWindow(QMainWindow):
         if self._pending_plan is None or self._execution_worker is not None:
             return
         plan = self._pending_plan
-        if isinstance(plan, DynamicAgentPlan) and plan.write_actions == ["publish_x"]:
-            answer = QMessageBox.warning(
-                self,
-                "确认自动发布到 X",
-                "此计划会通过当前比特浏览器账号公开发布一条 X 帖子。\n\n"
-                "发布内容可能由 Agent 根据前序分析生成；提交后不会自动撤回或重试。\n"
-                "是否确认执行整套计划并允许本次发布？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer is not QMessageBox.StandardButton.Yes:
-                self._pending_plan = None
-                if self._active_turn_id is not None:
-                    self._conversation.mark_cancelled(
-                        self._active_turn_id,
-                        "用户取消了本次 X 发布。",
-                    )
-                    self._active_turn_id = None
-                self._append_agent("已取消本次 X 发布。")
-                return
         self._pending_plan = None
         self.send_button.setEnabled(False)
         self.session_combo.setEnabled(False)
@@ -573,6 +596,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(max(0, min(percent, 100)))
         self.progress_value.setText(f"{percent}%")
         self.progress_label.setText(event.message)
+        self._append_progress_message(event.message, percent=percent)
 
     def _execution_succeeded(self, result: AgentExecutionResult) -> None:
         self._last_result = result
@@ -585,8 +609,8 @@ class MainWindow(QMainWindow):
         if result.output_directories:
             details += f"\n保存目录：{result.output_directories[0]}"
         if result.warnings:
-            details += "\n提醒：" + "；".join(result.warnings)
-        self._append_agent(details)
+            details += "\n运行信息：" + "；".join(result.warnings)
+        self._append_agent(details, error=result.completion_status != "completed")
 
     def _execution_failed(self, message: str) -> None:
         if self._active_turn_id is not None:
@@ -611,7 +635,12 @@ class MainWindow(QMainWindow):
             and self._session_manager_process.poll() is None
         ):
             return
+        self.manage_sessions_button.setEnabled(False)
+        self.manage_sessions_button.setText("正在打开管理窗口…")
         try:
+            self._session_manager_ready_dir = tempfile.TemporaryDirectory(
+                prefix="social-agent-gui-ready-"
+            )
             invoker = PluginInvoker(
                 self._plugin_manager,
                 session_registry=self._registry_path,
@@ -624,26 +653,34 @@ class MainWindow(QMainWindow):
             self._session_manager_process = invoker.launch_gui(
                 "com.socialagent.social-content",
                 ["--manage-sessions-only"],
+                ready_file=Path(self._session_manager_ready_dir.name) / "ready",
             )
-        except PluginError as exc:
+        except (PluginError, OSError) as exc:
+            self._reset_session_manager_launch()
             QMessageBox.information(
                 self,
                 "需要社媒浏览与下载插件",
                 f"{exc}\n\n请先点击顶部“Tool 插件”安装社媒浏览与下载插件。",
             )
             return
-        self.manage_sessions_button.setEnabled(False)
-        self.manage_sessions_button.setText("会话管理已打开")
+        self._session_manager_started_at = time.monotonic()
         self._session_manager_timer.start()
 
     def _poll_session_manager(self) -> None:
         process = self._session_manager_process
         if process is not None and process.poll() is None:
+            if self._session_manager_ready_dir is not None:
+                ready_path = Path(self._session_manager_ready_dir.name) / "ready"
+                try:
+                    ready = ready_path.read_text(encoding="utf-8").strip() == str(process.pid)
+                except OSError:
+                    ready = False
+                if ready:
+                    self.manage_sessions_button.setText("管理窗口已打开")
+                elif time.monotonic() - self._session_manager_started_at >= 15:
+                    self.manage_sessions_button.setText("管理窗口启动较慢，请稍候…")
             return
-        self._session_manager_timer.stop()
-        self._session_manager_process = None
-        self.manage_sessions_button.setEnabled(True)
-        self.manage_sessions_button.setText("管理比特浏览器会话")
+        self._reset_session_manager_launch()
         if process is not None and process.returncode:
             stderr = b""
             try:
@@ -658,6 +695,17 @@ class MainWindow(QMainWindow):
                 message += f"\n\n{detail}"
             QMessageBox.critical(self, "无法打开会话管理", message)
         self._refresh_sessions()
+
+    def _reset_session_manager_launch(self) -> None:
+        self._session_manager_timer.stop()
+        self._session_manager_process = None
+        if self._session_manager_ready_dir is not None:
+            self._session_manager_ready_dir.cleanup()
+            self._session_manager_ready_dir = None
+        self.manage_sessions_button.setEnabled(
+            self._plan_worker is None and self._execution_worker is None
+        )
+        self.manage_sessions_button.setText("管理浏览器窗口")
 
     def manage_plugins(self) -> None:
         dialog = PluginManagerDialog(self._plugin_manager, self)
@@ -700,6 +748,7 @@ class MainWindow(QMainWindow):
         if not records:
             self.session_combo.addItem("尚未注册登录会话", None)
             return
+        self.session_combo.addItem("根据任务自动选择窗口", AUTO_SESSION_REF)
         for record in records:
             self.session_combo.addItem(
                 f"{PLATFORM_LABELS.get(record.platform, record.platform)} · {record.profile_name}",
@@ -707,16 +756,12 @@ class MainWindow(QMainWindow):
             )
             if record.session_ref == selected:
                 self.session_combo.setCurrentIndex(self.session_combo.count() - 1)
-        if selected is None:
-            previous_session_ref = self._conversation.last_session_ref()
-            for index in range(self.session_combo.count()):
-                if self.session_combo.itemData(index) == previous_session_ref:
-                    self.session_combo.setCurrentIndex(index)
-                    break
+        if selected == AUTO_SESSION_REF or selected is None:
+            self.session_combo.setCurrentIndex(0)
 
     def _selected_record(self) -> SessionRecord | None:
         session_ref = self.session_combo.currentData()
-        if not session_ref:
+        if not session_ref or session_ref == AUTO_SESSION_REF:
             return None
         return self._registry.get(str(session_ref))
 
@@ -744,6 +789,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._reset_session_manager_launch()
         self._router.close()
         super().closeEvent(event)
 
@@ -754,7 +800,9 @@ class MainWindow(QMainWindow):
     def _set_planning(self, planning: bool) -> None:
         self.send_button.setEnabled(not planning)
         self.session_combo.setEnabled(not planning)
-        self.manage_sessions_button.setEnabled(not planning)
+        self.manage_sessions_button.setEnabled(
+            not planning and self._session_manager_process is None
+        )
         self.plugins_button.setEnabled(not planning)
         self.model_button.setEnabled(not planning)
         self.message_input.setEnabled(not planning)
@@ -788,6 +836,20 @@ class MainWindow(QMainWindow):
                 error=error,
             )
         )
+
+    def _append_progress_message(self, message: str, *, percent: int | None = None) -> None:
+        normalized = message.strip()
+        if not normalized:
+            return
+        display = (
+            f"总进度 {max(0, min(percent, 100))}% · {normalized}"
+            if percent is not None
+            else f"处理中 · {normalized}"
+        )
+        if display == self._last_progress_message:
+            return
+        self._last_progress_message = display
+        self._append_agent(display)
 
     def _restore_conversation(self) -> None:
         for turn in self._conversation.turns:

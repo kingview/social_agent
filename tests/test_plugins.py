@@ -211,7 +211,8 @@ def test_plugin_gui_does_not_inherit_frozen_host_qt_paths(
         llm_api_key="test",
     )
 
-    invoker.launch_gui(MANIFEST["id"], ["--manage-sessions-only"])
+    ready_file = tmp_path / "gui-ready"
+    invoker.launch_gui(MANIFEST["id"], ["--manage-sessions-only"], ready_file=ready_file)
 
     environment = captured["env"]
     assert isinstance(environment, dict)
@@ -219,6 +220,7 @@ def test_plugin_gui_does_not_inherit_frozen_host_qt_paths(
     assert "QT_QPA_PLATFORM_PLUGIN_PATH" not in environment
     assert "PYTHONPATH" not in environment
     assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert environment["SOCIAL_AGENT_GUI_READY_FILE"] == str(ready_file.resolve())
     assert captured["stderr"] is subprocess.PIPE
 
 

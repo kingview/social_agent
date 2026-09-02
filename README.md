@@ -7,8 +7,9 @@
 - 对话输入可以选择或拖入图片、视频和音频；允许只有附件、不选择浏览器会话的本地任务。
 - 图片通过 Harness `ImageBlock` 和 `dsh-attachment-local` 原生进入模型与持久会话。
 - 视频和音频由媒体 Tool 提取 OCR、关键画面理解、ASR/字幕和结构化摘要，再写入同一个 Harness 会话。
-- GUI 通过持久化 `ConversationCoordinator` 统一管理 conversation ID、每轮状态、失败原因、执行结果和上次所选 `session_ref`；重新打开 App 会恢复当前会话。同一次 App 运行内，Planning/Execution Harness 持续复用稳定 session；App 重启后使用新的 runtime epoch，并由协调器在 20,000 字符预算内回放最近的结构化历史，避开旧 Harness session 恢复时的空响应问题。后续的“重试”“继续”“根据刚才图片/视频”等指令因此仍有上下文。每轮下载数量和容量限制通过短生命周期策略通道下发给 MCP，并按 execution ID 重置；X 发布仍使用一次性隔离进程。
-- 使用 PostDrop 注册的抖音、小红书、X / Twitter、Telegram Web `session_ref`。
+- `ConversationCoordinator` 保存桌面聊天记录；核心 `TaskStore` 独立保存完整用户请求、任务关联、执行检查点与发布状态，不依赖 GUI 回调。旧聊天记录会自动迁移，聊天显示的 200 轮上限和模型上下文的 20,000 字符预算不会裁掉核心任务记录。同一次 App 运行内复用 Harness session，重启后使用新的 runtime epoch 并回放最近上下文。每轮数量与容量预算仍按 execution ID 隔离。
+- 使用 PostDrop 注册的抖音、小红书、X / Twitter、Telegram Web `session_ref`。GUI 默认“根据任务自动选择窗口”：Harness 根据平台、窗口名、账号用途和步骤从已注册窗口中选择；跨平台流程可同时使用多个窗口，也可在下拉框中手动锁定一个窗口。
+- GUI 点击“管理浏览器窗口”先展示已注册窗口列表；从列表点击“注册新窗口”打开独立注册弹框。注册成功后列表自动刷新并选中新窗口，关闭管理弹框后主界面同步更新。移除引用不会删除比特浏览器窗口或退出账号。
 - 关键词搜索、用户主页、推荐流/时间线、指定页面。
 - 只获取帖子 URL，或继续批量下载图片/视频。
 - 常规任务单次浏览最多 100 条；下载固定拆成每批最多 20 个 URL。
@@ -16,10 +17,14 @@
 - 默认跨批次总下载预算为 5 GB，不会把每批上限无限累加。
 - 会话中继续说“改成前50条”等方式调整上一个计划。
 - 输入任务后点击一次“发送”，Agent 会在后台生成计划并直接执行；公开发布等外部写操作仍使用单独的一次性授权。
+- Agent 输出区会先列出可观察的执行步骤，并在搜索、下载、分析、去水印、生成文案等阶段实时追加当前动作；总进度严格使用“已完成步骤数 / 计划总步骤数”计算，例如完成 2/5、正在执行第 3 步时显示 40%。
 - 当前批次完成后停止、实时进度、结果数量和下载目录。
 - 可在任务中明确要求“有水印就去水印”；Agent 会调用独立的 `media.process_watermark`，原视频始终保留。
 - 所有自然语言命令均由 DeepSeek Harness 规划：包括简单搜索下载，以及分析、标签/摘要、按结果继续筛选和生成本地文案草稿。
-- 明确要求“发布到 X”时，可在确认高风险计划后通过已登录的比特浏览器自动发布一条 X 帖子；不使用 X 官方 API。
+- 明确要求“发布到 X”时，发送后直接通过已登录的比特浏览器执行发布计划，不再弹出额外确认框；不使用 X 官方 API。
+- “重试／执行上次任务”由 Harness 选择历史任务标识，核心校验该任务原始用户要求后继承发布范围；本轮“不发布”覆盖历史要求。已经尝试过发布或结果不明时，不会仅凭“重试”再次提交。
+- 进度使用稳定的 `step_id`、`step_item_id` 和实际 Tool call ID 关联；同工具多步骤、并行乱序返回、批次重试不会串步或重复计数。一个分批步骤必须完成全部计划单元才计入总进度。旧调用只有在工具对应唯一单步时才自动匹配。X 必须返回 `state=published` 才算成功，未完成流程保存为 `partial/failed`。
+- X 发布前，核心 MCP 必须先在 `.social-agent-state/tasks.sqlite3` 提交持久标记；写入失败不会继续发送。记录只影响同一任务及其重试链，不会因另一独立任务发布过而阻止本任务；结果丢失也不会清除防重记录。
 - Harness 通过 MCP 只获得已安装且启用的白名单 Tool；没有 Shell、文件编辑或自动登录能力。
 - 可通过 `browser_operate` 在指定 `session_ref` 的比特浏览器窗口中观察页面、打开 HTTPS 页面、点击、输入搜索词、按键、滚动、上划、下划和翻页。
 
@@ -51,7 +56,7 @@ Telegram 频道全量下载示例：
 搜索 X 上的“web3”视频帖子，下载前20条，去除高置信度水印，分析并生成一条中文文案，发布到 X
 ```
 
-该任务会在计划卡片和独立确认框中明确提示外部发布；一次确认只允许发布一条，结果不明时不会自动重试。
+该任务会在聊天区展示执行计划并直接执行，不再弹出发布确认框。每次计划只允许发布一条，结果不明时不会自动重试；未明确要求发布的任务不获得发布权限。
 
 统一执行图：
 
@@ -72,7 +77,7 @@ GUI 不再直接选择或实例化具体 Runtime：
 
 ```text
 GUI Worker
-→ ConversationCoordinator（持久状态与重试上下文）
+→ ConversationCoordinator（聊天展示与恢复）
 → RuntimeRouter
    └── DeepSeekHarnessRuntime
 → ExecutionPolicy
@@ -81,7 +86,7 @@ GUI Worker
 
 `ExecutionPolicy` 统一拥有浏览数量、每批 URL、整次任务下载帖子数、总下载容量和 Tool 调用预算；Harness 和 MCP Server 不能放宽这些限制。即使模型错误地把 20 个 URL 传给“下载第一条”的任务，MCP 桥也只会转发第一个 URL。
 
-核心模块按职责分离：`conversation.py` 管理可恢复会话，`harness_prompts.py` 管理 Planning/Execution 提示与多模态消息块，`execution_policy_channel.py` 管理核心到常驻 MCP 的逐轮授权，`legacy_runtime.py` 隔离不再由 GUI 使用的固定工作流兼容实现。
+核心模块按职责分离：`conversation.py` 管理桌面聊天，`task_store.py` 管理完整任务与执行持久化，`task_intent.py` 校验任务来源，`step_binding.py` 关联步骤/批次，`tool_results.py` 核验结果，`execution_tracking.py` 计算进度。`harness_prompts.py` 管理提示与多模态消息，`execution_policy_channel.py` 下发逐轮授权，`legacy_runtime.py` 保留固定流程兼容实现。步骤标识由核心 MCP 消费，不传入现有插件，插件无需为此次重构重新安装。
 
 当前锁定 npm 已发布的 DeepSeek Harness `0.1.1-rc.2`。图片链路使用 Harness 官方
 `AttachmentStore`、`admitEncodedImages` 和 `ImageBlock`；本仓库仅补充一个与上游
@@ -152,7 +157,7 @@ MCP 保留七个标准具名 Tool，并增加 `list_plugin_tools` 与 `call_plug
 
 Agent App 不再静态打包爬虫、Playwright、OpenCV、ONNX、FFmpeg 或视频修复模型。当前两个插件是：
 
-- `social-content.socialtool`：帖子浏览、比特浏览器操作、媒体下载和经确认的 X 发布。
+- `social-content.socialtool`：帖子浏览、比特浏览器操作、媒体下载和用户明确要求的 X 发布。
 - `media-content.socialtool`：媒体分析、水印处理和本地文案生成。
 
 生成安装包：
@@ -203,11 +208,11 @@ macOS 默认使用 `/opt/homebrew/opt/node@24/bin/node`；可用 `SOCIAL_AGENT_N
 
 ## 安全边界
 
-- Agent 不支持自动登录、点赞、评论、关注、私信或转发；当前唯一平台写操作是经确认后发布一条 X 帖子。
+- Agent 不支持自动登录、点赞、评论、关注、私信或转发；当前唯一平台写操作是用户明确要求时发布一条 X 帖子。
 - `browser_operate` 仍只允许搜索、浏览和翻页；密码/文件输入控件以及发布、互动、交易、删除类点击会被 Tool 拒绝。发布只能调用独立 `publish_x_post`。
 - `publish_x_post` 要求 X 专属 `session_ref`、GUI 已确认的动态计划和只在本次执行有效的一次性令牌；令牌在浏览器操作前消费，成功、失败或结果不明均不会自动重试。
 - 发布媒体最多 4 个，且必须来自 Social Agent 输出目录，防止模型上传任意本地文件；发布 Tool 的审计摘要不记录令牌。
-- `session_ref` 只映射用户已手动登录的比特浏览器 Profile；不向模型发送 Cookie、密码、代理或指纹参数。
+- `session_ref` 只映射用户已手动登录的比特浏览器 Profile；自动选择只向规划模型提供平台、窗口名和不透明 `session_ref`，不发送 Cookie、密码、代理或指纹参数。执行策略会拒绝本轮计划未授权的窗口引用。
 - Profile 的代理和指纹在比特浏览器中预先配置，Agent 不轮换或修改它们。
 - 使用 `session_ref` 下载时，媒体请求会优先复用该 Profile 的 HTTP/HTTPS/SOCKS5 代理；Profile 为 `noproxy` 时使用本机网络直接下载，结果会明确标记实际路由。
 - 页面内容是不可信数据，不作为 Agent 指令执行。

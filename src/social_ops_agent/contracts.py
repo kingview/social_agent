@@ -156,18 +156,52 @@ class AgentProgress(BaseModel):
     message: str
 
 
+class BrowserSessionBinding(BaseModel):
+    """One locally registered BitBrowser profile authorized for a plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_ref: str = Field(
+        pattern=r"^sess_(?:douyin|xhs|x|telegram)_[A-Za-z0-9_-]{20,80}$",
+        max_length=96,
+    )
+    platform: Literal["douyin", "xiaohongshu", "x", "telegram"]
+    profile_name: str = Field(default="", max_length=300)
+
+    @model_validator(mode="after")
+    def validate_platform_prefix(self) -> BrowserSessionBinding:
+        prefix = {
+            "douyin": "sess_douyin_",
+            "xiaohongshu": "sess_xhs_",
+            "x": "sess_x_",
+            "telegram": "sess_telegram_",
+        }[self.platform]
+        if not self.session_ref.startswith(prefix):
+            raise ValueError("session_ref platform does not match browser session platform")
+        return self
+
+
 class DynamicAgentPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["dynamic_harness"] = "dynamic_harness"
-    objective: str = Field(min_length=1, max_length=2_000)
+    objective: str = Field(min_length=1, max_length=80_000)
+    task_id: str | None = Field(default=None, min_length=1, max_length=100)
     platform: Literal["douyin", "xiaohongshu", "x", "telegram"] | None = None
     session_ref: str | None = Field(
         default=None,
         pattern=r"^sess_(?:douyin|xhs|x|telegram)_[A-Za-z0-9_-]{20,80}$",
     )
+    browser_sessions: list[BrowserSessionBinding] = Field(default_factory=list, max_length=12)
     summary: str = Field(min_length=1, max_length=2_000)
     steps: list[str] = Field(min_length=1, max_length=12)
+    step_tools: list[Literal[
+        "browse_posts", "browser_operate", "download_media", "analyze_content",
+        "process_watermark", "generate_post_copy", "publish_x_post", "call_plugin_tool",
+        "local_reasoning",
+    ]] = Field(default_factory=list, max_length=12)
+    step_units: list[int] = Field(default_factory=list, max_length=12)
+    resume_turn_id: str | None = Field(default=None, max_length=100)
     attachments: list[AgentAttachment] = Field(default_factory=list, max_length=8)
     media_context: str | None = Field(default=None, max_length=80_000)
     max_download_posts: int | None = Field(default=None, ge=1, le=100)
@@ -177,6 +211,18 @@ class DynamicAgentPlan(BaseModel):
 
     @model_validator(mode="after")
     def validate_optional_browser_session(self) -> DynamicAgentPlan:
+        if self.step_tools and len(self.step_tools) != len(self.steps):
+            raise ValueError("step_tools must contain one tool for each step")
+        if self.step_units and (len(self.step_units) != len(self.steps) or
+                                any(type(n) is not int or not 1 <= n <= 100 for n in self.step_units)):
+            raise ValueError("step_units must contain a positive unit count (1..100) for each step")
+        if self.step_tools and any(tool in {"publish_x_post", "local_reasoning"} and count != 1
+                                   for tool, count in zip(self.step_tools, self.step_units)):
+            raise ValueError("publishing and reasoning steps must have exactly one unit")
+        if self.step_tools and sum(count for tool, count in
+                                  zip(self.step_tools, self.step_units or [1] * len(self.steps))
+                                  if tool != "local_reasoning") > self.max_tool_calls:
+            raise ValueError("step_units require more calls than max_tool_calls")
         if (self.platform is None) != (self.session_ref is None):
             raise ValueError("platform and session_ref must either both be present or both be absent")
         if self.platform is not None and self.session_ref is not None:
@@ -188,10 +234,42 @@ class DynamicAgentPlan(BaseModel):
             }[self.platform]
             if not self.session_ref.startswith(prefix):
                 raise ValueError("session_ref platform does not match plan platform")
+        if self.browser_sessions:
+            refs = [item.session_ref for item in self.browser_sessions]
+            if len(refs) != len(set(refs)):
+                raise ValueError("browser sessions must be unique")
+            primary = self.browser_sessions[0]
+            if self.platform != primary.platform or self.session_ref != primary.session_ref:
+                raise ValueError("primary browser session must match platform and session_ref")
         if self.write_actions:
-            if self.platform != "x" or self.session_ref is None:
+            available_platforms = (
+                {item.platform for item in self.browser_sessions}
+                if self.browser_sessions
+                else ({self.platform} if self.platform else set())
+            )
+            if "x" not in available_platforms:
                 raise ValueError("X publishing requires an authorized X browser session")
         return self
+
+    def execution_steps(self) -> list[dict]:
+        return [
+            {"step_id": f"step-{index + 1}", "title": title,
+             "tool": (self.step_tools or ["unverified"] * len(self.steps))[index],
+             "units": (self.step_units or [1] * len(self.steps))[index]}
+            for index, title in enumerate(self.steps)
+        ]
+
+    def authorized_browser_sessions(self) -> list[BrowserSessionBinding]:
+        if self.browser_sessions:
+            return list(self.browser_sessions)
+        if self.platform is None or self.session_ref is None:
+            return []
+        return [
+            BrowserSessionBinding(
+                platform=self.platform,
+                session_ref=self.session_ref,
+            )
+        ]
 
 
 class AgentRunResult(BaseModel):
@@ -225,6 +303,10 @@ class AgentExecutionResult(BaseModel):
     metrics: dict[str, int | float | str | bool] = Field(default_factory=dict)
     cancelled: bool = False
     finish_reason: str | None = None
+    completion_status: Literal["completed", "partial", "failed"] = "completed"
+    completed_steps: int = Field(default=0, ge=0)
+    total_steps: int = Field(default=0, ge=0)
+    publish_state: Literal["not_requested", "not_attempted", "published", "failed", "unknown"] = "not_requested"
 
 
 class RuntimeHealth(BaseModel):

@@ -37,9 +37,11 @@ class AgentRuntime(Protocol):
         session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
         *,
+        available_sessions: tuple[SelectedSession, ...] = (),
         attachments: tuple[AgentAttachment, ...] = (),
         media_context: str | None = None,
         context_summary: str | None = None,
+        task_id: str | None = None,
     ) -> RuntimePlan: ...
 
     def execute(
@@ -83,17 +85,21 @@ class DeepSeekHarnessRuntime:
         session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
         *,
+        available_sessions: tuple[SelectedSession, ...] = (),
         attachments: tuple[AgentAttachment, ...] = (),
         media_context: str | None = None,
         context_summary: str | None = None,
+        task_id: str | None = None,
     ) -> DynamicAgentPlan:
         del previous_plan
         plan = self.backend.propose(
             message,
             session,
+            available_sessions=available_sessions,
             attachments=attachments,
             media_context=media_context,
             context_summary=context_summary,
+            task_id=task_id,
         )
         self.policy.validate_plan(plan)
         return plan
@@ -152,9 +158,11 @@ class RuntimeRouter:
         session: SelectedSession | None,
         previous_plan: AgentPlan | None = None,
         *,
+        available_sessions: tuple[SelectedSession, ...] = (),
         attachments: tuple[AgentAttachment, ...] = (),
         media_context: str | None = None,
         context_summary: str | None = None,
+        task_id: str | None = None,
     ) -> RuntimePlan:
         try:
             self.policy.validate_message(message)
@@ -164,9 +172,11 @@ class RuntimeRouter:
             message,
             session,
             previous_plan,
+            available_sessions=available_sessions,
             attachments=attachments,
             media_context=media_context,
             context_summary=context_summary,
+            task_id=task_id,
         )
 
     def execute(
@@ -229,9 +239,14 @@ def _harness_result(result: HarnessExecutionResult) -> AgentExecutionResult:
     return AgentExecutionResult(
         runtime="deepseek_harness",
         plan=result.plan,
-        summary=result.response or "任务完成，但模型没有返回文字总结。",
+        summary=result.user_summary(),
         tool_calls=result.tool_calls,
         tool_calls_used=len(result.tool_calls),
+        warnings=result.warnings,
         cancelled=result.cancelled,
         finish_reason=result.finish_reason,
+        completion_status=result.completion_status,
+        completed_steps=result.completed_steps,
+        total_steps=result.total_steps,
+        publish_state=result.publish_state,
     )

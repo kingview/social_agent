@@ -398,14 +398,19 @@ LangChain 类型不得进入核心领域模型、数据库结构或执行协议�
 
 - Node.js 要求 `22.19+`，当前开发与打包基线为 Node.js 24。
 - Python GUI 通过 stdio JSON-RPC 启动独立 Harness Runtime，不把 Node 类型暴露给业务层。
-- 规划 Cordis 不加载任何 Tool；只有用户确认计划后才启动执行 Cordis。
-- 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills 和工作区上下文；平台写操作默认禁用，只有用户确认的 X 发布计划会获得一次性授权。
+- 规划 Cordis 不加载任何 Tool；用户发送任务后，核心校验计划并启动执行 Cordis，无二次确认弹框。
+- 执行 Cordis 仅加载 `mcp__social__*` 白名单，禁用 Bash、Jobs、Skills 和工作区上下文；平台写操作默认禁用，只有用户文字明确要求的 X 发布计划会获得一次性授权，不再额外弹框。
 - MCP 插件桥保留七个标准具名 Tool，并暴露 `list_plugin_tools` 与 `call_plugin_tool` 发现和调用后续插件能力。
 - 桌面 GUI 的 LLM 设置支持本地 Ollama、OpenAI API 和自定义 OpenAI-compatible 端点；默认连接 Ollama `qwen3.5:9b`，生产环境仍建议通过 Model Gateway 路由。
 - 当前选中的端点、模型和进程内凭据会注入 Planning Cordis、Execution Cordis 及其 MCP 插件进程，避免规划、附件分析和文案生成意外使用不同模型。
 - 非敏感设置写入用户级 `llm-settings.json`；远端 API Key 仅存入 macOS Keychain 或 Windows Credential Manager。OpenAI API 使用独立 Platform API Key，不复用 ChatGPT 消费者订阅或登录会话。
 - Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
-- `ConversationCoordinator` 是桌面会话状态的唯一所有者，将 conversation ID、用户请求、计划、运行状态、失败阶段、执行结果和最近 `session_ref` 原子写入 `.social-agent-state/conversations/active.json`。App 重启后恢复相同 conversation ID；退出前仍处于 planning/planned/executing 的轮次会被恢复为可重试的 interrupted failure。同一次 App 运行内，Planning 与 Execution Harness 复用稳定 session ID；App 重启后使用新的 runtime epoch，并在 20,000 字符预算内按时间顺序回放尽可能多的最近结构化轮次，避免直接恢复旧 Harness session 导致空事件。因此“重试”“继续”和省略主语的后续命令在进程内读取 Harness 原生历史，跨重启读取协调器持久历史。
+- `ConversationCoordinator` 只拥有桌面聊天展示缓存 `.social-agent-state/conversations/active.json`。权威任务存储为核心 `TaskStore`（`.social-agent-state/tasks.sqlite3`），按 conversation ID / task ID 保存未截断的原始请求、`resume_turn_id`、计划、execution ID、步骤检查点和发布状态。旧 active.json 幂等迁移，不删除原文件；后续超过 200 轮的完整任务记录仍在数据库中。模型上下文是另行生成的、最多 20,000 字符的展示摘要，不得用它校验发布授权。App 重启后恢复相同 conversation ID，以核心终态覆盖未收到 GUI 完成回调的缓存；未完成轮次恢复为中断状态。同次运行复用 Harness session，重启使用新 runtime epoch 与摘要回放，避免恢复旧 Harness session 的空事件问题。
+- Harness 决定自然语言指向的历史任务；核心 `task_intent.py` 只校验本会话的完整原始请求和任务链。发布防重检查覆盖该任务及其后续重试（包括兄弟分支），不扫描时间上更晚的无关任务。执行前再次校验，不从模型总结、附件或网页推导授权。
+- Planning 输出的 `steps` 必须是可观察、可独立完成的执行阶段，不能把打开搜索页、输入关键词和点选结果拆成多个 UI 微动作。Execution Backend 在每次 Tool 调用开始和结束时发出步骤事件，`completed` 表示已经完成的计划步骤数；GUI 使用 `completed / total` 计算总进度并把当前步骤实时追加到 Agent 输出区。若 5 步任务已完成 2 步且正在执行第 3 步，进度保持 40%，第三步完成后才变为 60%。
+- 步骤标识由核心生成 `step-1…`，主要工具由 `step_tools` 声明，可选 `step_units` 声明该步必须成功的批次/执行单元数（默认 1）。执行提示提供规范化 `execution_steps`；核心 MCP 接收 `step_id` 和 `step_item_id=item-1…`，校验后剥离这两个字段再调用插件，因此不改变插件协议。`ExecutionTracker` 用实际 Tool call ID 关联结果，并按步骤/单元去重，失败重试沿用原单元，全部单元成功才完成该步骤。缺少标识的旧调用只在全计划唯一匹配时兼容；重复工具步骤不得猜测归属。结果归一化与成功判断在独立 `tool_results.py` 中，部分批次或未确认发布不能增加完成数。
+- 执行生命周期和每次进度检查点由核心 Backend 写入 TaskStore；GUI 只显示事件与镜像结果。MCP 在调用发布插件前以 SQLite 事务提交不可回退的 `publish_attempted` 标记，磁盘故障则拒绝发送；提交后丢失响应保持 unknown，明确收到 `state=published` 才确认成功。数据库事务也阻止两个重试分支同时发布。GUI/CLI/服务入口共用该机制，不依赖界面是否仍在运行。任务记录不保存 Tool 参数和一次性令牌，已有会话/代理凭据仍由原存储管理。
+- Harness 若在 Tool 全部成功且最终 assistant 文本已经落盘后才发生上下文溢出或压缩错误，客户端会从该 execution session 的 JSONL 恢复最终文本、向结果附加运行错误并重置执行 session；不会把已经完成的下载、分析或文案任务误报为空响应，也不会自动重复执行有副作用的 Tool。
 - 每轮执行前，`ExecutionPolicyChannel` 以新的 execution ID 原子写入短生命周期本地授权；常驻 MCP 在每次下载调用前重新读取，并按 execution ID 重置帖子数、URL 去重集合和容量预算。授权在该轮结束后撤销，因此无需牺牲 Execution 上下文来隔离数量限制。X 发布仍使用带一次性令牌的独立 Execution/MCP 进程。
 - 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
 
@@ -422,7 +427,9 @@ RuntimeRouter
 └── legacy_runtime.DeterministicAgentRuntime → SocialOperationsAgent
 
 共享：
-├── ConversationCoordinator
+├── ConversationCoordinator（桌面展示缓存）
+├── TaskStore / task_intent（完整任务、来源、执行检查点）
+├── step_binding / ExecutionTracker / tool_results（步骤关联与结果核验）
 ├── ExecutionPolicy
 ├── ExecutionPolicyChannel
 ├── LLMSettings
@@ -585,17 +592,21 @@ tools/
 
 `media.generate_post_copy` 不直接发布内容。它只生成结构化候选，继续发布时必须进入平台写操作的 Policy、审批和审计链。桌面 GUI 与 Agent 调用共用同一 Pydantic 契约、OpenAI-compatible 模型适配器和审计日志。生成过程把分析结果和用户补充要求都视为不可信数据，避免 Prompt 注入；文案不得编造分析证据之外的事实。
 
-`social.publish_x_post` 是当前唯一允许的外部写 Tool，并且不复用通用 `browser.operate` 的点击能力。只有用户文字明确表达发布到 X、所选 `session_ref` 属于 X、规划契约写入 `write_actions=["publish_x"]`，且用户在 GUI 的高风险确认框中确认后，Execution Backend 才启动新的隔离 MCP 进程并签发随机一次性令牌。令牌同时由核心 MCP 与插件验证，在打开/操作浏览器前消费，执行结束立即销毁。一次计划最多发布一条；HTTP/GraphQL 失败或结果不明均不自动重试。媒体必须位于 Agent 输出根目录内且最多 4 个，审计日志排除令牌。通用页面 Tool 继续拦截发布按钮与文件输入，因此无法绕过专用发布契约。
+`social.publish_x_post` 是当前唯一允许的外部写 Tool，并且不复用通用 `browser.operate` 的点击能力。只有用户文字明确表达发布到 X、所选 `session_ref` 属于 X、规划契约写入 `write_actions=["publish_x"]`，GUI 点击发送后不再弹出二次确认框，Execution Backend 按该执行范围启动新的隔离 MCP 进程并签发随机一次性令牌。令牌同时由核心 MCP 与插件验证，在打开/操作浏览器前消费，执行结束立即销毁。一次计划最多发布一条；HTTP/GraphQL 失败或结果不明均不自动重试。媒体必须位于 Agent 输出根目录内且最多 4 个，审计日志排除令牌。通用页面 Tool 继续拦截发布按钮与文件输入，因此无法绕过专用发布契约。
+
+续执行时，Planning Harness 输出 `resume_turn_id` 和 `write_actions`；核心只从当前会话中被引用的原始用户消息校验发布权限，不能从模型总结或媒体文本授予权限。本轮“不发布”覆盖历史范围，普通新任务不自动继承写权限。上下文同时携带发布尝试标记和结果；GUI 收到发布调用事件即持久化标记，已尝试、结果不明或中断的任务不能仅凭“重试”重复提交。规划修复轮保留相同上下文与具体校验错误。
+
+执行步骤由 Planning Harness 以 `steps` 与 `step_tools` 一一映射，核心通过 Harness 原生 `tool/call` 的 callId 与 `tool/result` 中 toolCallId 关联实际结果。错误、空结果、辅助工具和重复生成不会推进其他步骤；X 发布只有工具返回 `state=published` 才完成。最终结果保存 `completion_status`、`completed_steps`、`total_steps`、`publish_state`，会话按实际结果记录 `succeeded/partial/failed`，不把 LLM 正常结束等同于任务完成。旧计划缺少工具映射时保守标记未核验，不伪造 100% 进度。
 
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
-`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书、X 或 Telegram Web 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。抖音、小红书和 X 的单次登录态下载经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的代理；Telegram 不导出 Cookie，而是在已登录页面上下文内读取消息和分块获取媒体，因此自然沿用 Profile 代理。Telegram 频道全量任务由下载 Tool 内部的确定性状态机执行：稳定输出目录按会话、频道和媒体格式派生，逐条写入 JSONL manifest，重试时跳过已完成消息，并以消息数、总容量、页面停滞或到达顶部作为显式终止条件。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时输出 `direct`，均不包含代理详情。当前实现不自动登录、不修改或轮换代理和指纹，也不承担账号调度；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
+`social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书、X 或 Telegram Web 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。桌面端默认把已注册窗口的最小元数据（平台、窗口名、不透明引用）作为候选交给 Planning Harness；模型根据用户提示中的平台、窗口名、账号用途和步骤返回一个或多个候选引用，核心再对照本地注册表验证。跨平台流程因此可以先在素材窗口浏览下载，再在 X 窗口发布；手动下拉选择仍可锁定唯一窗口。每轮执行策略文件携带允许引用集合，MCP 在每次浏览、下载或发布前机械校验，模型虚构或越权切换窗口会被拒绝。抖音、小红书和 X 的单次登录态下载经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的代理；Telegram 不导出 Cookie，而是在已登录页面上下文内读取消息和分块获取媒体，因此自然沿用 Profile 代理。Telegram 频道全量任务由下载 Tool 内部的确定性状态机执行：稳定输出目录按会话、频道和媒体格式派生，逐条写入 JSONL manifest，重试时跳过已完成消息，并以消息数、总容量、页面停滞或到达顶部作为显式终止条件。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时输出 `direct`，均不包含代理详情。当前实现不自动登录、不修改或轮换代理和指纹；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
 
-`social.browse_posts` 与下载 Tool 分离。它通过平台专属 `session_ref` 找到已授权比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一会话必须串行执行，限制最大条数、滚动次数、等待时间和超时；页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成 → 可选审批后发布 X 构成可审计的组合工作流。
+`social.browse_posts` 与下载 Tool 分离。它通过本轮计划授权的平台专属 `session_ref` 找到比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一窗口必须串行执行，限制最大条数、滚动次数、等待时间和超时；一次任务可以按计划顺序使用多个不同窗口。页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成 → 可选审批后发布 X 构成可审计的组合工作流。
 
 `browser.operate` 补足无法预先固化的平台页面流程。比特浏览器官方 Local API 负责 Profile 生命周期：健康检查、列表/详情、创建/修改、打开/关闭、代理和指纹配置等；页面内 DOM 点击、输入和滚动不属于 Local API 端点。Tool 因此只调用 `/browser/open` 获取回环地址上的 WebSocket/HTTP CDP 端点，再由 Playwright 操作该 Profile 中的可见标签页。支持 `observe`、`navigate`、`click`、`input`、`press`、`scroll`、`back`、`forward`、`reload` 和 `wait`；`observe` 返回短期 `element_ref`，供后续动作复用。导航仅接受公开 HTTPS 地址；禁止密码、验证码、密钥和文件输入，并在点击前拦截发布、互动、交易、账户变更及删除类控件。每个 `session_ref` 串行操作，目标标签页和元素引用仅保留在本机进程内，页面正文仍按不可信输入处理。当前版本不调用 `/browser/add`、`/browser/modify`、`/browser/close`、`/browser/delete` 或代理批量修改接口，Profile、代理和指纹继续由用户在比特浏览器中预配置。
 
-本地 `Social Agent` Client 提供会话式任务入口。所有自然语言先经过策略拒绝检查，再由无 Tool 的 Planning Cordis 转换成 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条、单次下载调用最多 20 URL，并另外执行整次任务的帖子数上限。随后由只含已安装、已启用插件能力的 Execution Cordis/MCP Tool Bridge 执行搜索下载、逐步点击/输入/翻页、分析、筛选、总结、生成文案和可选 X 发布。X 发布计划在执行前显示独立外部写确认框。确定性有限状态 Runtime 仅保留为兼容实现，不再接收 GUI 自然语言命令。所有路径保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
+本地 `Social Agent` Client 提供会话式任务入口。所有自然语言先经过策略拒绝检查，再由无 Tool 的 Planning Cordis 转换成 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条、单次下载调用最多 20 URL，并另外执行整次任务的帖子数上限。随后由只含已安装、已启用插件能力的 Execution Cordis/MCP Tool Bridge 执行搜索下载、逐步点击/输入/翻页、分析、筛选、总结、生成文案和可选 X 发布。X 发布计划在聊天区展示后直接执行，不再显示独立确认框；`requires_confirmation` 保留兼容字段，但新计划统一为 `false`。确定性有限状态 Runtime 仅保留为兼容实现，不再接收 GUI 自然语言命令。所有路径保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
 
 `media.process_watermark` 与下载器保持分离。下载器始终保存原始 artifact；水印 Tool 用 OpenCV 抽帧检测画面任意位置的持久静态叠加层，并从每个采样帧提取文字/Logo 候选，通过归一化边缘描述子跨帧聚类：同一外观在至少 35% 采样帧中重复、位置变化且相似度达到高置信阈值时，自动判定为动态水印。轨迹不要求从首个采样帧开始，周期滚动水印与固定水印可在同一视频中同时返回。仅在任务明确要求、用户确认授权且候选达到置信度和面积阈值时才生成带 `derived_from_sha256` 的衍生 artifact。默认的本机时序修复不再擦除整个粗检测框：它从多帧持久边缘生成细粒度笔画 mask，以动态候选首次可靠出现的时间点建立模板并向视频前后双向跟踪；局部匹配降级时执行全画面重新定位，以处理滚动水印的循环跳转。随后逐帧 Telea inpaint，并使用稠密光流把上一帧修复结果对齐后仅在 mask 内低比例融合，以降低闪烁和矩形模糊。快速模式保留 FFmpeg `delogo`/矩形 inpaint 作为低成本路径。低置信度、间歇出现或复杂形变候选可在 Watermark Studio 人工框选首帧区域后跟踪，并强制标记为需要人工检查。Social Agent 可将其作为每个下载批次后的可选步骤，原文件禁止覆盖。
 
@@ -1696,7 +1707,7 @@ MVP 可以共享一个 PostgreSQL 集群，但必须使用独立 Schema、Reposi
 | 多模型如何接入 | LiteLLM Proxy + Model Gateway |
 | Tool 在哪里定义 | 自研 Tool Registry，Pydantic/JSON Schema 为权威协议 |
 | 桌面 Tool 如何部署 | `.socialtool` 用户级插件；独立 Python/MCP 进程，不写入 Agent App |
-| LLM 是否直接执行外部动作 | 未审批时否；已确认的 X 发布计划只获得一次性、单次 Tool 授权 |
+| LLM 是否直接执行外部动作 | 用户未明确要求时否；明确要求的 X 发布计划只获得一次性、单次 Tool 授权，无二次弹框 |
 | 外部操作如何执行 | Policy Engine + Approval + Execution Gateway |
 | 账号如何选择 | 确定性约束求解和负载分配 |
 | 风险后如何优化 | 熔断、复盘、离线评测、审批后发布 |

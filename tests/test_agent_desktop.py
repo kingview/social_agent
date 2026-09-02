@@ -4,12 +4,20 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from social_ops_agent.desktop import MainWindow, _chat_message_html
-from social_ops_agent.contracts import AgentExecutionResult, AgentPlan, DynamicAgentPlan
+from social_ops_agent.desktop import AUTO_SESSION_REF, ExecutionWorker, MainWindow, _chat_message_html
+from social_ops_agent.contracts import (
+    AgentExecutionResult,
+    AgentPlan,
+    AgentProgress,
+    BrowserSessionBinding,
+    DynamicAgentPlan,
+)
 from social_ops_agent.conversation import ConversationCoordinator
 from social_ops_agent.model_settings_dialog import ModelSettingsDialog
 from social_ops_agent.settings import LLMSettings, LLMSettingsStore
@@ -75,7 +83,10 @@ def test_desktop_has_single_send_control(tmp_path: Path) -> None:
     )
 
     assert "社媒任务助手" in window.windowTitle()
-    assert window.session_combo.itemText(0).startswith("抖音")
+    assert window.session_combo.itemText(0) == "根据任务自动选择窗口"
+    assert window.session_combo.currentData() == AUTO_SESSION_REF
+    assert window.session_combo.itemText(1).startswith("抖音")
+    assert window.manage_sessions_button.text() == "管理浏览器窗口"
     assert window.send_button.text() == "发送"
     assert window.send_button.isEnabled()
     assert not hasattr(window, "execute_button")
@@ -103,6 +114,65 @@ def test_desktop_has_single_send_control(tmp_path: Path) -> None:
     assert executions == [plan]
     window.close()
     app.processEvents()
+
+
+@pytest.mark.parametrize("publish,legacy_confirmation", [(True, False), (True, True), (False, False)])
+def test_plan_starts_without_extra_publish_confirmation(
+    tmp_path, monkeypatch, publish, legacy_confirmation
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        registry_path=tmp_path / "sessions.json",
+        output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+        llm_settings_store=LLMSettingsStore(
+            tmp_path / "llm.json", credentials=MemoryCredentials()
+        ),
+    )
+    started = []
+    # Exercise the GUI handoff, but never start Harness, browser work or publishing.
+    monkeypatch.setattr(ExecutionWorker, "start", lambda worker: started.append(worker))
+
+    def unexpected_dialog(*_args, **_kwargs):
+        pytest.fail("Sending a task must not open an extra publish confirmation")
+
+    monkeypatch.setattr("social_ops_agent.desktop.QMessageBox.warning", unexpected_dialog)
+    monkeypatch.setattr("social_ops_agent.desktop.QMessageBox.question", unexpected_dialog)
+    session_ref = "sess_x_abcdefghijklmnopqrstuvwx"
+    objective = "生成文案并发到 X" if publish else "生成本地文案草稿"
+    plan = DynamicAgentPlan(
+        objective=objective,
+        platform="x",
+        session_ref=session_ref,
+        browser_sessions=[BrowserSessionBinding(
+            platform="x", session_ref=session_ref, profile_name="测试 X 窗口"
+        )],
+        summary=objective,
+        steps=["生成文案", "发布到 X"] if publish else ["生成文案"],
+        write_actions=["publish_x"] if publish else [],
+        requires_confirmation=legacy_confirmation,
+    )
+    turn_id = window._conversation.begin_turn(plan.objective)
+    window._active_turn_id = turn_id
+    try:
+        window._plan_succeeded(plan)
+        assert window._pending_plan is None
+        turn = window._conversation.turns[-1]
+        persisted = json.loads(window._conversation.path.read_text())["turns"][-1]
+        assert len(started) == 1
+        assert started[0]._plan == plan
+        assert window._execution_worker is started[0]
+        assert turn.status == persisted["status"] == "executing"
+        assert window._active_turn_id == turn_id
+        assert "已取消本次 X 发布" not in window.chat.toPlainText()
+        assert "开始执行" in window.chat.toPlainText()
+        # Duplicate callbacks must not start a second execution.
+        window.execute_plan()
+        assert len(started) == 1
+    finally:
+        window._execution_finished()
+        window.close()
+        app.processEvents()
 
 
 def test_model_settings_fields_are_equal_width_and_height(tmp_path: Path) -> None:
@@ -216,7 +286,146 @@ def test_desktop_restores_active_conversation_and_last_session(tmp_path: Path) -
     )
 
     assert window._conversation_id == conversation_id
-    assert window.session_combo.currentData() == "sess_xhs_abcdefghijklmnopqrstuvwx"
+    assert window.session_combo.currentData() == AUTO_SESSION_REF
     assert "第一条已经下载" in window.chat.toPlainText()
+    window.close()
+    app.processEvents()
+
+
+def test_execution_progress_is_rendered_in_agent_chat_by_completed_steps(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        registry_path=tmp_path / "sessions.json",
+        output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+        llm_settings_store=LLMSettingsStore(
+            tmp_path / "llm.json", credentials=MemoryCredentials()
+        ),
+    )
+
+    window._execution_progress(
+        AgentProgress(
+            stage="step",
+            completed=2,
+            total=5,
+            message="第 3/5 步：分析内容（正在分析图片、视频和文本）",
+        )
+    )
+
+    assert window.progress_bar.value() == 40
+    assert window.progress_value.text() == "40%"
+    assert "总进度 40%" in window.chat.toPlainText()
+    assert "第 3/5 步" in window.chat.toPlainText()
+    window.close()
+    app.processEvents()
+
+
+def test_gui_persists_partial_completion_and_publish_attempt(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        registry_path=tmp_path / "sessions.json", output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+        llm_settings_store=LLMSettingsStore(tmp_path / "llm.json", credentials=MemoryCredentials()),
+    )
+    turn_id = window._conversation.begin_turn("继续并发布到X")
+    window._active_turn_id = turn_id
+    window._execution_progress(AgentProgress(stage="publishing", completed=4, total=5, message="发布中"))
+    # Display-only progress cannot create an authoritative publication marker.
+    assert json.loads(window._conversation.path.read_text())["turns"][-1]["publish_attempted"] is False
+    window._execution_succeeded(AgentExecutionResult(
+        runtime="deepseek_harness",
+        plan=DynamicAgentPlan(objective="发布", summary="发布", steps=["发布"]),
+        summary="任务未全部完成：X 发布结果不明", completion_status="partial",
+        completed_steps=4, total_steps=5, publish_state="unknown",
+    ))
+    persisted = json.loads(window._conversation.path.read_text())["turns"][-1]
+    assert persisted["status"] == "partial"
+    assert persisted["result"]["publish_state"] == "unknown"
+    assert window.progress_bar.value() == 80
+    assert "任务未全部完成" in window.chat.toPlainText()
+    window.close()
+    app.processEvents()
+
+
+def test_registration_button_waits_for_child_window_ready(tmp_path, monkeypatch) -> None:
+    import time
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        registry_path=tmp_path / "sessions.json",
+        output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+        llm_settings_store=LLMSettingsStore(tmp_path / "llm.json", credentials=MemoryCredentials()),
+    )
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    process = FakeProcess()
+    launches = []
+
+    def launch_gui(_self, _plugin_id, _args, *, ready_file):
+        launches.append(ready_file)
+        return process
+
+    monkeypatch.setattr("social_ops_agent.desktop.PluginInvoker.launch_gui", launch_gui)
+    window.manage_sessions()
+    assert window.manage_sessions_button.text() == "正在打开管理窗口…"
+    assert not window.manage_sessions_button.isEnabled()
+    window.manage_sessions()
+    assert len(launches) == 1
+    window._poll_session_manager()
+    assert window.manage_sessions_button.text() == "正在打开管理窗口…"
+
+    # Another process's marker must not claim this window is ready.
+    launches[0].write_text("99999", encoding="utf-8")
+    window._session_manager_started_at = time.monotonic() - 16
+    window._poll_session_manager()
+    assert window.manage_sessions_button.text() == "管理窗口启动较慢，请稍候…"
+    launches[0].write_text(str(process.pid), encoding="utf-8")
+    window._poll_session_manager()
+    assert window.manage_sessions_button.text() == "管理窗口已打开"
+    window._set_planning(False)
+    assert not window.manage_sessions_button.isEnabled()
+
+    process.returncode = 0
+    window._poll_session_manager()
+    assert window.manage_sessions_button.text() == "管理浏览器窗口"
+    assert window.manage_sessions_button.isEnabled()
+    assert not launches[0].parent.exists()
+    assert window._session_manager_process is None
+    window.close()
+    app.processEvents()
+
+
+def test_registration_launch_failure_restores_button(tmp_path, monkeypatch) -> None:
+    from social_ops_agent.plugins import PluginError
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        registry_path=tmp_path / "sessions.json",
+        output_root=tmp_path / "downloads",
+        plugin_root=tmp_path / "plugins",
+        llm_settings_store=LLMSettingsStore(tmp_path / "llm.json", credentials=MemoryCredentials()),
+    )
+
+    def launch_gui(*_args, **_kwargs):
+        raise PluginError("test launch failure")
+
+    messages = []
+    monkeypatch.setattr("social_ops_agent.desktop.PluginInvoker.launch_gui", launch_gui)
+    monkeypatch.setattr("social_ops_agent.desktop.QMessageBox.information", lambda *args: messages.append(args))
+    window.manage_sessions()
+    assert messages
+    assert window.manage_sessions_button.text() == "管理浏览器窗口"
+    assert window.manage_sessions_button.isEnabled()
+    assert window._session_manager_ready_dir is None
+    assert not window._session_manager_timer.isActive()
     window.close()
     app.processEvents()

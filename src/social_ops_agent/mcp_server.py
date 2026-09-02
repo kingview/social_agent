@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -12,6 +14,8 @@ from .execution_policy_channel import read_execution_policy
 from .plugins import PluginInvoker, PluginManager
 from .policy import DEFAULT_EXECUTION_POLICY
 from .settings import LLMSettings
+from .step_binding import resolve_step
+from .task_store import TaskStore
 
 
 _STANDARD_TYPED_TOOLS = {
@@ -26,11 +30,11 @@ _STANDARD_TYPED_TOOLS = {
 
 
 SERVER_INSTRUCTIONS = """Local Tool plugin bridge for Social Agent.
-Only use the selected opaque session_ref. Never request raw cookies, passwords,
+Only use opaque session_ref values authorized for the current execution. Never request raw cookies, passwords,
 verification codes, proxy credentials, or browser fingerprints. Installed Tool
 plugins must not like, comment, follow, repost, message, purchase, or log into an
 account. X publishing is allowed only through publish_x_post with the one-time
-approval token issued after GUI confirmation. Original downloaded media must be preserved."""
+approval token issued for the user's current or explicitly resumed task. Original downloaded media must be preserved."""
 
 mcp = FastMCP("social-agent-tools", instructions=SERVER_INSTRUCTIONS)
 
@@ -39,6 +43,7 @@ class PluginToolRuntime:
     def __init__(self) -> None:
         self.output_root = _required_path("SOCIAL_AGENT_OUTPUT_ROOT")
         self.state_root = _required_path("SOCIAL_AGENT_STATE_ROOT")
+        self.task_store = TaskStore(self.state_root)
         self.session_registry = _required_path("SOCIAL_AGENT_SESSION_REGISTRY", file=True)
         self.policy = DEFAULT_EXECUTION_POLICY
         self.download_budget_remaining_bytes = self.policy.max_total_download_mb * 1024 * 1024
@@ -47,7 +52,10 @@ class PluginToolRuntime:
             Path(raw_policy_path).expanduser().resolve() if raw_policy_path else None
         )
         self.active_execution_id: str | None = None
+        self.task_id: str | None = None
+        self.steps: list[dict] = []
         self.max_download_posts: int | None = None
+        self.allowed_session_refs: set[str] = set()
         self.downloaded_post_urls: set[str] = set()
         self.download_lock = asyncio.Lock()
         self.publish_lock = asyncio.Lock()
@@ -75,6 +83,16 @@ class PluginToolRuntime:
                 self.policy.max_total_download_mb * 1024 * 1024
             )
         self.max_download_posts = policy.max_download_posts if policy is not None else None
+        self.task_id = policy.task_id if policy else None
+        self.steps = policy.steps if policy else []
+        self.allowed_session_refs = (
+            set(policy.allowed_session_refs) if policy is not None else set()
+        )
+
+    def require_authorized_session(self, session_ref: str) -> None:
+        self.refresh_execution_policy()
+        if not self.active_execution_id or session_ref not in self.allowed_session_refs:
+            raise ValueError("session_ref is not authorized for the current execution")
 
 
 _runtime: PluginToolRuntime | None = None
@@ -105,7 +123,8 @@ async def list_plugin_tools(live_schemas: bool = True) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def call_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def call_plugin_tool(tool_name: str, arguments: dict[str, Any],
+                           step_id: str | None = None, step_item_id: str | None = None) -> dict[str, Any]:
     """Call a Tool declared by an installed and enabled plugin.
 
     Use this for capabilities added by future plugins after list_plugin_tools.
@@ -115,12 +134,25 @@ async def call_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[st
         raise ValueError(
             f"{tool_name} is a standard Tool; call mcp__social__{tool_name} directly"
         )
-    return await _invoke_plugin_tool(tool_name, arguments)
+    _check_step("call_plugin_tool", step_id, step_item_id)
+    output = await runtime().invoker.call(tool_name, arguments)
+    return output if isinstance(output, dict) else {"result": output}
 
 
 async def _invoke_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    arguments = dict(arguments)
+    _check_step(tool_name, arguments.pop("step_id", None), arguments.pop("step_item_id", None))
     output = await runtime().invoker.call(tool_name, arguments)
     return output if isinstance(output, dict) else {"result": output}
+
+
+def _check_step(tool: str, step_id: str | None, step_item_id: str | None) -> None:
+    tool_runtime = runtime()
+    tool_runtime.refresh_execution_policy()
+    steps = getattr(tool_runtime, "steps", [])
+    binding = resolve_step(steps, tool, step_id, step_item_id)
+    if binding is None and any(step["tool"] == tool for step in steps):
+        raise ValueError("Repeated or batched planned tools require step_id and step_item_id")
 
 
 @mcp.tool()
@@ -134,8 +166,11 @@ async def browse_posts(
     start_url: str | None = None,
     max_items: int = 20,
     max_scrolls: int = 8,
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Browse Douyin, Xiaohongshu, X, or Telegram Web through the social-content plugin."""
+    runtime().require_authorized_session(session_ref)
     return await _invoke_plugin_tool(
         "browse_posts",
         {
@@ -148,6 +183,8 @@ async def browse_posts(
             "start_url": start_url,
             "max_items": max_items,
             "max_scrolls": max_scrolls,
+            "step_id": step_id,
+            "step_item_id": step_item_id,
         },
     )
 
@@ -182,6 +219,8 @@ async def browser_operate(
     wait_after_ms: int = 600,
     max_elements: int = 40,
     text_excerpt_chars: int = 4_000,
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Perform one read-only BitBrowser operation.
 
@@ -189,6 +228,7 @@ async def browser_operate(
     put the content in value. text is a target locator, not the input content.
     url is only valid for navigate.
     """
+    runtime().require_authorized_session(session_ref)
     return await _invoke_plugin_tool("browser_operate", locals())
 
 
@@ -200,11 +240,15 @@ async def download_media(
     max_total_size_mb: int = 1000,
     telegram_scope: Literal["messages", "channel"] = "messages",
     telegram_max_messages: int = 2000,
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Download posts, or one complete Telegram channel with checkpoints."""
     tool_runtime = runtime()
     async with tool_runtime.download_lock:
         tool_runtime.refresh_execution_policy()
+        tool_runtime.require_authorized_session(session_ref)
+        _check_step("download_media", step_id, step_item_id)
         unique_urls = list(dict.fromkeys(urls))[: tool_runtime.policy.max_download_urls_per_call]
         if telegram_scope != "channel" and tool_runtime.max_download_posts is not None:
             remaining_posts = max(
@@ -263,9 +307,12 @@ async def analyze_content(
     post_text: str | None = None,
     source_url: str | None = None,
     language_hint: str | None = "zh",
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Analyze local images, videos, or audio using the analyzer plugin."""
-    return await _invoke_plugin_tool("analyze_content", locals())
+    output = await _invoke_plugin_tool("analyze_content", locals())
+    return _compact_analysis_output(output, runtime().output_root)
 
 
 @mcp.tool()
@@ -273,6 +320,8 @@ async def process_watermark(
     file_paths: list[str],
     minimum_confidence: float = 0.72,
     repair_quality: str = "auto",
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Detect watermarks and create repaired copies; originals are preserved."""
     return await _invoke_plugin_tool("process_watermark", locals())
@@ -287,6 +336,8 @@ async def generate_post_copy(
     extra_instructions: str | None = None,
     variant_count: int = 3,
     max_characters: int = 300,
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate local social copy drafts grounded in an analysis result."""
     return await _invoke_plugin_tool("generate_post_copy", locals())
@@ -298,10 +349,14 @@ async def publish_x_post(
     text: str,
     approval_token: str,
     media_paths: list[str] | None = None,
+    step_id: str | None = None,
+    step_item_id: str | None = None,
 ) -> dict[str, Any]:
-    """Publish exactly one X post approved in the current GUI execution plan."""
+    """Publish exactly one X post authorized by the current task."""
     tool_runtime = runtime()
     async with tool_runtime.publish_lock:
+        tool_runtime.require_authorized_session(session_ref)
+        _check_step("publish_x_post", step_id, step_item_id)
         expected = tool_runtime.publish_approval_token
         if (
             not expected
@@ -310,6 +365,10 @@ async def publish_x_post(
         ):
             raise ValueError("X publication approval is missing, invalid, expired, or already used")
         # Consume before forwarding because an ambiguous browser result must not be retried.
+        if not tool_runtime.task_id or not tool_runtime.active_execution_id:
+            raise ValueError("X publication requires a durable task execution")
+        task_id, execution_id = tool_runtime.task_id, tool_runtime.active_execution_id
+        tool_runtime.task_store.reserve_publish(task_id, execution_id)
         tool_runtime.publish_approval_consumed = True
         output = await tool_runtime.invoker.call(
             "publish_x_post",
@@ -320,7 +379,9 @@ async def publish_x_post(
                 "media_paths": media_paths or [],
             },
         )
-        return output if isinstance(output, dict) else {"result": output}
+        output = output if isinstance(output, dict) else {"result": output}
+        tool_runtime.task_store.publish_result(task_id, execution_id, output.get("state", "unknown"))
+        return output
 
 
 def _required_path(name: str, *, file: bool = False) -> Path:
@@ -333,6 +394,98 @@ def _required_path(name: str, *, file: bool = False) -> Path:
     else:
         path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _compact_analysis_output(output: dict[str, Any], output_root: Path) -> dict[str, Any]:
+    """Persist the complete analysis while keeping the model context bounded."""
+    encoded = json.dumps(output, ensure_ascii=False, indent=2)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    result_dir = output_root / "analysis-results"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"analysis-{digest[:16]}.json"
+    if not result_path.is_file():
+        temporary = result_path.with_suffix(".tmp")
+        temporary.write_text(encoded, encoding="utf-8")
+        temporary.replace(result_path)
+
+    compact_keys = (
+        "language",
+        "summary",
+        "topics",
+        "entities",
+        "claims",
+        "image_summary",
+        "video_summary",
+        "transcript_summary",
+        "sentiment",
+        "commercial_intent",
+        "safety_flags",
+        "confidence",
+        "needs_human_review",
+        "warnings",
+        "cache_hit",
+        "pipeline_version",
+        "model_versions",
+    )
+    compact = {key: output.get(key) for key in compact_keys if key in output}
+    compact["tags"] = [
+        {
+            key: tag.get(key)
+            for key in ("namespace", "label", "confidence")
+            if key in tag
+        }
+        for tag in output.get("tags", [])[:50]
+        if isinstance(tag, dict)
+    ]
+    compact["evidence_preview"] = [
+        {
+            **{
+                key: evidence.get(key)
+                for key in ("evidence_id", "kind", "timestamp_seconds", "confidence")
+                if key in evidence
+            },
+            "text": str(evidence.get("text") or "")[:500],
+        }
+        for evidence in output.get("evidence", [])[:12]
+        if isinstance(evidence, dict)
+    ]
+    compact["assets"] = [
+        {
+            key: asset.get(key)
+            for key in (
+                "artifact_sha256",
+                "media_type",
+                "modality",
+                "width",
+                "height",
+                "duration_seconds",
+                "sampled_frame_count",
+                "warnings",
+            )
+            if key in asset
+        }
+        for asset in output.get("assets", [])[:20]
+        if isinstance(asset, dict)
+    ]
+    compact["full_result_path"] = str(result_path)
+    compact["full_result_sha256"] = digest
+    compact["context_compacted"] = len(encoded) > 20_000
+    for key in (
+        "summary",
+        "image_summary",
+        "video_summary",
+        "transcript_summary",
+        "sentiment",
+        "commercial_intent",
+    ):
+        if key in compact:
+            compact[key] = str(compact[key] or "")[:4_000]
+    if len(json.dumps(compact, ensure_ascii=False)) > 20_000:
+        compact["claims"] = [str(item)[:500] for item in compact.get("claims", [])[:20]]
+        compact["entities"] = list(compact.get("entities", []))[:20]
+        compact["evidence_preview"] = compact["evidence_preview"][:5]
+        compact["context_compacted"] = True
+    return compact
 
 
 def main() -> None:

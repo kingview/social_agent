@@ -17,7 +17,13 @@ _X_PUBLISH_INTENT = re.compile(
 )
 
 
+def publishing_declined(message: str) -> bool:
+    return bool(re.search(r"(?:不要|别|不必|暂不|无需|勿|do not|don't)\s*(?:再|自动|公开)?\s*(?:发布|发帖|发|post|publish)", message, re.IGNORECASE))
+
+
 def requested_write_actions(message: str) -> tuple[str, ...]:
+    if publishing_declined(message):
+        return ()
     return ("publish_x",) if _X_PUBLISH_INTENT.search(message) else ()
 
 
@@ -36,8 +42,8 @@ class ExecutionPolicy:
             )
         write_actions = requested_write_actions(message)
         generic_publish = any(word in message for word in ("发布", "发帖", "发送到"))
-        if generic_publish and not write_actions:
-            raise ExecutionPolicyError("当前只支持经过确认后自动发布到 X，不支持其他平台写操作。")
+        if generic_publish and not write_actions and not publishing_declined(message):
+            raise ExecutionPolicyError("当前只支持用户明确要求的自动发布到 X，不支持其他平台写操作。")
 
     def validate_plan(self, plan: Any) -> None:
         limit = getattr(plan, "limit", None)
