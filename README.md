@@ -7,7 +7,7 @@
 - 对话输入可以选择或拖入图片、视频和音频；允许只有附件、不选择浏览器会话的本地任务。
 - 图片通过 Harness `ImageBlock` 和 `dsh-attachment-local` 原生进入模型与持久会话。
 - 视频和音频由媒体 Tool 提取 OCR、关键画面理解、ASR/字幕和结构化摘要，再写入同一个 Harness 会话。
-- 同一 GUI 会话内持续复用 Harness 进程与 session；后续的“根据刚才图片/视频”等指令可使用原生历史与压缩上下文。
+- GUI 通过持久化 `ConversationCoordinator` 统一管理 conversation ID、每轮状态、失败原因、执行结果和上次所选 `session_ref`；重新打开 App 会恢复当前会话。同一次 App 运行内，Planning/Execution Harness 持续复用稳定 session；App 重启后使用新的 runtime epoch，并由协调器在 20,000 字符预算内回放最近的结构化历史，避开旧 Harness session 恢复时的空响应问题。后续的“重试”“继续”“根据刚才图片/视频”等指令因此仍有上下文。每轮下载数量和容量限制通过短生命周期策略通道下发给 MCP，并按 execution ID 重置；X 发布仍使用一次性隔离进程。
 - 使用 PostDrop 注册的抖音、小红书、X / Twitter、Telegram Web `session_ref`。
 - 关键词搜索、用户主页、推荐流/时间线、指定页面。
 - 只获取帖子 URL，或继续批量下载图片/视频。
@@ -18,7 +18,7 @@
 - 输入任务后点击一次“发送”，Agent 会在后台生成计划并直接执行；公开发布等外部写操作仍使用单独的一次性授权。
 - 当前批次完成后停止、实时进度、结果数量和下载目录。
 - 可在任务中明确要求“有水印就去水印”；Agent 会调用独立的 `media.process_watermark`，原视频始终保留。
-- 复杂任务由 DeepSeek Harness 动态规划：下载后分析、标签/摘要、按结果继续筛选、生成本地文案草稿。
+- 所有自然语言命令均由 DeepSeek Harness 规划：包括简单搜索下载，以及分析、标签/摘要、按结果继续筛选和生成本地文案草稿。
 - 明确要求“发布到 X”时，可在确认高风险计划后通过已登录的比特浏览器自动发布一条 X 帖子；不使用 X 官方 API。
 - Harness 通过 MCP 只获得已安装且启用的白名单 Tool；没有 Shell、文件编辑或自动登录能力。
 - 可通过 `browser_operate` 在指定 `session_ref` 的比特浏览器窗口中观察页面、打开 HTTPS 页面、点击、输入搜索词、按键、滚动、上划、下划和翻页。
@@ -53,18 +53,7 @@ Telegram 频道全量下载示例：
 
 该任务会在计划卡片和独立确认框中明确提示外部发布；一次确认只允许发布一条，结果不明时不会自动重试。
 
-对应的确定性执行图：
-
-```text
-自然语言
-→ AgentPlan（平台、session_ref、搜索条件、数量、是否下载）
-→ 用户确认
-→ social.browse_posts（最多 100 条）
-→ social.download_media（每批最多 20 条，共最多 5 批）
-→ AgentExecutionResult
-```
-
-动态执行图：
+统一执行图：
 
 ```text
 自然语言 + 图片 / 视频 / 音频
@@ -72,7 +61,7 @@ Telegram 频道全量下载示例：
 → 图片：Harness Attachment Store + ImageBlock
 → 视频/音频：媒体 Tool 输入归一化 → 结构化媒体上下文
 → 无 Tool 的 Harness Planning Cordis
-→ DynamicAgentPlan
+→ DynamicAgentPlan（含本次任务的帖子下载总数上限）
 → 用户确认
 → Harness Execution Cordis
 → MCP 插件桥（通用浏览器操作 / 帖子浏览 / 下载 / 分析 / 去水印 / 文案草稿 / 一次性 X 发布）
@@ -83,14 +72,16 @@ GUI 不再直接选择或实例化具体 Runtime：
 
 ```text
 GUI Worker
+→ ConversationCoordinator（持久状态与重试上下文）
 → RuntimeRouter
-   ├── DeterministicAgentRuntime
    └── DeepSeekHarnessRuntime
 → ExecutionPolicy
 → AgentExecutionResult
 ```
 
-`ExecutionPolicy` 统一拥有浏览数量、每批 URL、总下载容量和 Tool 调用预算；两个 Runtime 和 MCP Server 不能各自放宽这些限制。
+`ExecutionPolicy` 统一拥有浏览数量、每批 URL、整次任务下载帖子数、总下载容量和 Tool 调用预算；Harness 和 MCP Server 不能放宽这些限制。即使模型错误地把 20 个 URL 传给“下载第一条”的任务，MCP 桥也只会转发第一个 URL。
+
+核心模块按职责分离：`conversation.py` 管理可恢复会话，`harness_prompts.py` 管理 Planning/Execution 提示与多模态消息块，`execution_policy_channel.py` 管理核心到常驻 MCP 的逐轮授权，`legacy_runtime.py` 隔离不再由 GUI 使用的固定工作流兼容实现。
 
 当前锁定 npm 已发布的 DeepSeek Harness `0.1.1-rc.2`。图片链路使用 Harness 官方
 `AttachmentStore`、`admitEncodedImages` 和 `ImageBlock`；本仓库仅补充一个与上游
@@ -124,7 +115,7 @@ py -m venv .venv
 .venv\Scripts\social-ops-agent.exe
 ```
 
-常规搜索下载优先使用确定性中文解析；无法固定解析的表达，以及包含分析、筛选、总结、文案等动态任务，使用 OpenAI-compatible 模型端点。GUI 顶部的 **LLM** 按钮可以在以下来源间切换，保存后立即应用到 Harness 规划、执行、多媒体预分析和 Tool 插件：
+所有 GUI 自然语言命令均使用配置的 OpenAI-compatible 模型端点并交由 Harness 规划和执行。确定性代码只负责契约校验、权限和数量上限，不再根据关键词接管自然语言任务。GUI 顶部的 **LLM** 按钮可以在以下来源间切换，保存后立即应用到 Harness 规划、执行、多媒体预分析和 Tool 插件：
 
 - 本地 Ollama；默认 `qwen3.5:9b`。
 - OpenAI API；填写 API Key 和模型 ID。
@@ -220,12 +211,12 @@ macOS 默认使用 `/opt/homebrew/opt/node@24/bin/node`；可用 `SOCIAL_AGENT_N
 - Profile 的代理和指纹在比特浏览器中预先配置，Agent 不轮换或修改它们。
 - 使用 `session_ref` 下载时，媒体请求会优先复用该 Profile 的 HTTP/HTTPS/SOCKS5 代理；Profile 为 `noproxy` 时使用本机网络直接下载，结果会明确标记实际路由。
 - 页面内容是不可信数据，不作为 Agent 指令执行。
-- 其他平台写操作在进入固定规划器或 Harness 之前统一拒绝，不能通过复杂表述绕过；X 发布意图则强制进入 Harness 高风险计划。
+- 其他平台写操作在进入 Harness 之前统一拒绝，不能通过复杂表述绕过；X 发布意图进入 Harness 高风险计划。
 - 规划 Cordis 没有 Tool；执行 Cordis 只加载 `mcp__social__*`，禁用 Bash、Jobs、Skills 和工作区上下文。
 - 只应访问和保存有权使用的内容，并遵守平台规则与适用法律。
 
 ## Harness 与 LangGraph
 
-当前常规下载路径保留有限状态 Runtime，非固定路径使用 DeepSeek Harness。领域层不依赖 Harness 类型以外的内部事件；未来需要服务端复杂图或多 Agent 复核时，可在相同 Runtime Adapter 后增加 LangGraph，而不改动 MCP/Pydantic Tool 契约。
+当前所有自然语言任务统一使用 DeepSeek Harness；有限状态 Runtime 仅保留为代码兼容层，不再由 GUI 路由。领域层不依赖 Harness 类型以外的内部事件；未来需要服务端复杂图或多 Agent 复核时，可在相同 Runtime Adapter 后增加 LangGraph，而不改动 MCP/Pydantic Tool 契约。
 
 Harness 通过 npm 安装模块化运行组件，不把完整 GitHub 源码 vendoring 到本仓库。`harness/package.json` 与 `package-lock.json` 锁定版本，`npm ci` 负责可重复安装；只有要修改 Harness 内核时才应维护独立 Fork 或 Git submodule。

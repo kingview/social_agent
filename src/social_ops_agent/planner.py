@@ -280,10 +280,78 @@ def _keyword_text(message: str) -> str | None:
 
 
 def _limit(message: str) -> int | None:
-    for pattern in (r"前\s*(\d{1,3})\s*(?:个|条|篇)?", r"(\d{1,3})\s*(?:个|条|篇)\s*帖子"):
+    if re.search(r"首\s*(?:个|条|篇)?\s*(?:帖子|结果|内容)?", message):
+        return 1
+    count_token = r"(\d{1,3}|[零一二两三四五六七八九十百]{1,5})"
+    for pattern in (
+        rf"(?:前|第)\s*{count_token}\s*(?:个|条|篇)?\s*(?:帖子|结果|内容)?",
+        rf"{count_token}\s*(?:个|条|篇)\s*(?:帖子|结果|内容)",
+    ):
         match = re.search(pattern, message)
         if match:
-            return max(1, min(int(match.group(1)), 100))
+            parsed = _count_value(match.group(1))
+            if parsed is not None:
+                return max(1, min(parsed, 100))
+    return None
+
+
+def requested_download_limit(message: str) -> int | None:
+    """Return an explicit post-download count for policy enforcement.
+
+    Harness remains responsible for understanding the whole request. This
+    narrow parser only turns an unambiguous quantity following “下载” into a
+    hard upper bound so a model cannot expand “下载第一条” into a bulk download.
+    """
+    download_at = message.find("下载")
+    if download_at < 0:
+        return None
+    tail = message[download_at:]
+    parsed = _limit(tail)
+    if parsed is not None:
+        return parsed
+    count_token = r"(\d{1,3}|[零一二两三四五六七八九十百]{1,5})"
+    match = re.search(rf"下载(?:搜索结果)?(?:中|里的?|的)?\s*{count_token}\s*(?:个|条|篇)", tail)
+    if not match:
+        return None
+    value = _count_value(match.group(1))
+    return None if value is None else max(1, min(value, 100))
+
+
+def _count_value(token: str) -> int | None:
+    if token.isdigit():
+        return int(token)
+    digits = {
+        "零": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if token == "百":
+        return 100
+    if "百" in token:
+        hundreds, remainder = token.split("百", 1)
+        if hundreds not in digits or digits[hundreds] == 0:
+            return None
+        suffix = _count_value(remainder) if remainder else 0
+        return None if suffix is None else digits[hundreds] * 100 + suffix
+    if token == "十":
+        return 10
+    if "十" in token:
+        tens, ones = token.split("十", 1)
+        tens_value = 1 if not tens else digits.get(tens)
+        ones_value = 0 if not ones else digits.get(ones)
+        if tens_value is None or ones_value is None:
+            return None
+        return tens_value * 10 + ones_value
+    if len(token) == 1:
+        return digits.get(token)
     return None
 
 

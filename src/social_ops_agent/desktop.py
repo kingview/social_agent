@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, QThread, QTimer, QUrl, Signal
@@ -10,7 +9,6 @@ from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -27,8 +25,9 @@ from PySide6.QtWidgets import (
 )
 
 from .agent_runtime import RuntimePlan, RuntimeRouter
+from .conversation import ConversationCoordinator
 from .contracts import AgentExecutionResult, AgentPlan, AgentProgress, DynamicAgentPlan
-from .model_settings_dialog import ModelSettingsDialog
+from .model_settings_dialog import ModelSettingsDialog, UniformComboBox
 from .multimodal import SUPPORTED_SUFFIXES, MultimodalInputError, prepare_multimodal_input
 from .plugin_desktop import PluginManagerDialog
 from .plugins import PluginError, PluginInvoker, PluginManager
@@ -57,7 +56,6 @@ class PlanWorker(QThread):
         message: str,
         session: SelectedSession | None,
         attachment_paths: list[Path],
-        previous_plan: AgentPlan | None,
         context_summary: str | None,
         conversation_id: str,
         registry_path: Path,
@@ -70,7 +68,6 @@ class PlanWorker(QThread):
         self._message = message
         self._session = session
         self._attachment_paths = list(attachment_paths)
-        self._previous_plan = previous_plan
         self._context_summary = context_summary
         self._conversation_id = conversation_id
         self._registry_path = registry_path
@@ -95,7 +92,6 @@ class PlanWorker(QThread):
             plan = self._router.propose(
                 self._message,
                 self._session,
-                self._previous_plan,
                 attachments=prepared.attachments,
                 media_context=prepared.media_context,
                 context_summary=self._context_summary,
@@ -121,9 +117,6 @@ class ExecutionWorker(QThread):
         self,
         *,
         plan: RuntimePlan,
-        registry_path: Path,
-        output_root: Path,
-        conversation_id: str,
         router: RuntimeRouter,
         parent: QWidget | None = None,
     ) -> None:
@@ -181,17 +174,20 @@ class MainWindow(QMainWindow):
         self._llm_settings_store = llm_settings_store or LLMSettingsStore()
         self._settings_load_error: str | None = None
         try:
-            self._llm_settings = self._llm_settings_store.load()
+            self._llm_settings = self._llm_settings_store.load_metadata()
         except LLMSettingsError as exc:
             self._llm_settings = LLMSettings.from_env()
             self._settings_load_error = str(exc)
-        self._conversation_id = f"conversation-{uuid.uuid4().hex}"
+        self._conversation = ConversationCoordinator(
+            self._output_root / ".social-agent-state"
+        )
+        self._conversation_id = self._conversation.conversation_id
         self._router = self._new_router()
         self._plan_worker: PlanWorker | None = None
         self._execution_worker: ExecutionWorker | None = None
         self._pending_plan: RuntimePlan | None = None
-        self._last_plan: AgentPlan | None = None
-        self._last_result: AgentExecutionResult | None = None
+        self._last_result = self._conversation.last_result()
+        self._active_turn_id: str | None = None
         self._attachment_paths: list[Path] = []
         self._session_manager_process = None
         self._session_manager_timer = QTimer(self)
@@ -219,7 +215,7 @@ class MainWindow(QMainWindow):
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Social Agent")
         title.setObjectName("title")
-        subtitle = QLabel("固定 Workflow + DeepSeek Harness 动态编排；发送后自动执行。")
+        subtitle = QLabel("所有自然语言命令由 DeepSeek Harness 理解并编排；发送后自动执行。")
         subtitle.setObjectName("subtitle")
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
@@ -247,7 +243,7 @@ class MainWindow(QMainWindow):
         session_layout.setContentsMargins(16, 12, 16, 12)
         session_label = QLabel("执行会话")
         session_label.setObjectName("fieldLabel")
-        self.session_combo = QComboBox()
+        self.session_combo = UniformComboBox()
         self.session_combo.setObjectName("control")
         self.manage_sessions_button = QPushButton("管理比特浏览器会话")
         self.manage_sessions_button.setObjectName("secondaryButton")
@@ -325,10 +321,13 @@ class MainWindow(QMainWindow):
         input_layout.addLayout(action_row)
         layout.addWidget(input_frame)
 
-        self._append_agent(
-            "可以直接添加图片、视频或音频并描述需求；需要浏览社媒时，再选择一个已经在比特浏览器中手动登录的会话。"
-            "图片使用 Harness 原生多模态；视频音频先提取内容，再与文字和会话历史一起理解。"
-        )
+        if self._conversation.turns:
+            self._restore_conversation()
+        else:
+            self._append_agent(
+                "可以直接添加图片、视频或音频并描述需求；需要浏览社媒时，再选择一个已经在比特浏览器中手动登录的会话。"
+                "图片使用 Harness 原生多模态；视频音频先提取内容，再与文字和会话历史一起理解。"
+            )
         if self._settings_load_error:
             self._append_agent(
                 f"模型设置读取失败，已暂时使用环境默认值：{self._settings_load_error}",
@@ -429,6 +428,15 @@ class MainWindow(QMainWindow):
                 "请添加图片、视频或音频；如需浏览社媒平台，还要选择登录会话。",
             )
             return
+        if not self._ensure_llm_secret():
+            return
+        context_summary = self._conversation.context_for_next_turn()
+        self._active_turn_id = self._conversation.begin_turn(
+            message,
+            attachment_names=[path.name for path in attachments],
+            session_ref=record.session_ref if record is not None else None,
+            platform=record.platform if record is not None else None,
+        )
         self._append_user(message, attachments=attachments)
         self.message_input.clear()
         self._set_planning(True)
@@ -445,8 +453,7 @@ class MainWindow(QMainWindow):
             message=message,
             session=session,
             attachment_paths=attachments,
-            previous_plan=self._last_plan,
-            context_summary=self._last_result.summary if self._last_result else None,
+            context_summary=context_summary,
             conversation_id=self._conversation_id,
             registry_path=self._registry_path,
             output_root=self._output_root,
@@ -461,14 +468,37 @@ class MainWindow(QMainWindow):
         self._plan_worker = worker
         worker.start()
 
+    def _ensure_llm_secret(self) -> bool:
+        try:
+            hydrated = self._llm_settings_store.with_secret(self._llm_settings)
+        except LLMSettingsError as exc:
+            QMessageBox.warning(
+                self,
+                "无法读取模型密钥",
+                f"{exc}\n\n请在顶部“LLM”设置中重新保存 API Key。",
+            )
+            return False
+        if hydrated != self._llm_settings:
+            self._router.close()
+            self._llm_settings = hydrated
+            self._router = self._new_router()
+        return True
+
     def _plan_succeeded(self, plan: RuntimePlan) -> None:
         self.clear_attachments()
         self._pending_plan = plan
-        if isinstance(plan, AgentPlan):
-            self._last_plan = plan
+        if self._active_turn_id is not None:
+            self._conversation.mark_planned(self._active_turn_id, plan)
         self.execute_plan()
 
     def _plan_failed(self, message: str) -> None:
+        if self._active_turn_id is not None:
+            self._conversation.mark_failed(
+                self._active_turn_id,
+                stage="planning",
+                error=message,
+            )
+            self._active_turn_id = None
         self._append_agent(f"无法处理消息：{message}", error=True)
 
     def _planning_status(self, message: str) -> None:
@@ -495,6 +525,12 @@ class MainWindow(QMainWindow):
             )
             if answer is not QMessageBox.StandardButton.Yes:
                 self._pending_plan = None
+                if self._active_turn_id is not None:
+                    self._conversation.mark_cancelled(
+                        self._active_turn_id,
+                        "用户取消了本次 X 发布。",
+                    )
+                    self._active_turn_id = None
                 self._append_agent("已取消本次 X 发布。")
                 return
         self._pending_plan = None
@@ -511,12 +547,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_value.show()
+        if self._active_turn_id is not None:
+            self._conversation.mark_executing(self._active_turn_id)
         self._append_agent("开始执行。")
         worker = ExecutionWorker(
             plan=plan,
-            registry_path=self._registry_path,
-            output_root=self._output_root,
-            conversation_id=self._conversation_id,
             router=self._router,
             parent=self,
         )
@@ -541,6 +576,9 @@ class MainWindow(QMainWindow):
 
     def _execution_succeeded(self, result: AgentExecutionResult) -> None:
         self._last_result = result
+        if self._active_turn_id is not None:
+            self._conversation.mark_succeeded(self._active_turn_id, result)
+            self._active_turn_id = None
         details = result.summary
         if result.tool_calls:
             details += "\nTool：" + "、".join(result.tool_calls)
@@ -551,6 +589,13 @@ class MainWindow(QMainWindow):
         self._append_agent(details)
 
     def _execution_failed(self, message: str) -> None:
+        if self._active_turn_id is not None:
+            self._conversation.mark_failed(
+                self._active_turn_id,
+                stage="execution",
+                error=message,
+            )
+            self._active_turn_id = None
         self._append_agent(f"执行失败：{message}", error=True)
 
     def _execution_finished(self) -> None:
@@ -662,6 +707,12 @@ class MainWindow(QMainWindow):
             )
             if record.session_ref == selected:
                 self.session_combo.setCurrentIndex(self.session_combo.count() - 1)
+        if selected is None:
+            previous_session_ref = self._conversation.last_session_ref()
+            for index in range(self.session_combo.count()):
+                if self.session_combo.itemData(index) == previous_session_ref:
+                    self.session_combo.setCurrentIndex(index)
+                    break
 
     def _selected_record(self) -> SessionRecord | None:
         session_ref = self.session_combo.currentData()
@@ -675,10 +726,10 @@ class MainWindow(QMainWindow):
             return
         self.chat.clear()
         self._pending_plan = None
-        self._last_plan = None
         self._last_result = None
+        self._active_turn_id = None
         self._router.close()
-        self._conversation_id = f"conversation-{uuid.uuid4().hex}"
+        self._conversation_id = self._conversation.new_conversation()
         self._router = self._new_router()
         self.clear_attachments()
         self.progress_frame.hide()
@@ -725,13 +776,38 @@ class MainWindow(QMainWindow):
         if attachments:
             names = "、".join(_html(path.name) for path in attachments)
             attached = f"<br><span class='attachment'>附件：{names}</span>"
-        self.chat.append(f"<div class='user'><b>你</b><br>{_html(message)}{attached}</div>")
+        body = _html(message).replace(chr(10), "<br>") + attached
+        self.chat.append(_chat_message_html("你", body, side="right"))
 
     def _append_agent(self, message: str, *, error: bool = False) -> None:
-        css_class = "error" if error else "agent"
         self.chat.append(
-            f"<div class='{css_class}'><b>Agent</b><br>{_html(message).replace(chr(10), '<br>')}</div>"
+            _chat_message_html(
+                "Agent",
+                _html(message).replace(chr(10), "<br>"),
+                side="left",
+                error=error,
+            )
         )
+
+    def _restore_conversation(self) -> None:
+        for turn in self._conversation.turns:
+            attachments = [Path(name) for name in turn.attachment_names]
+            self._append_user(turn.user_message, attachments=attachments)
+            if isinstance(turn.result, dict):
+                summary = str(turn.result.get("summary") or "任务已完成。")
+                self._append_agent(summary)
+            elif turn.error:
+                prefix = (
+                    "已取消"
+                    if turn.status == "cancelled"
+                    else "上次任务中断"
+                    if turn.error_stage == "interrupted"
+                    else "执行失败"
+                )
+                self._append_agent(
+                    f"{prefix}：{turn.error}",
+                    error=turn.status != "cancelled",
+                )
 
 
 def default_output_root() -> Path:
@@ -746,6 +822,33 @@ def _html(value: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
+    )
+
+
+def _chat_message_html(
+    label: str,
+    body_html: str,
+    *,
+    side: str,
+    error: bool = False,
+) -> str:
+    """Render a Qt-rich-text chat row with a stable left/right column."""
+    if side not in {"left", "right"}:
+        raise ValueError("chat message side must be left or right")
+    background = "#362126" if error else ("#28303b" if side == "right" else "#1b1e25")
+    border = "#7c3e49" if error else ("#465365" if side == "right" else "#343945")
+    label_color = "#ff9ca8" if error else ("#d8ff52" if side == "left" else "#b8c7dc")
+    bubble = (
+        f'<td width="72%" bgcolor="{background}" '
+        f'style="border:1px solid {border}; padding:10px 12px;">'
+        f'<div align="left"><span style="color:{label_color}; font-weight:700;">'
+        f'{_html(label)}</span><br><span style="color:#eef0f3;">{body_html}</span></div></td>'
+    )
+    spacer = '<td width="28%"></td>'
+    cells = f"{spacer}{bubble}" if side == "right" else f"{bubble}{spacer}"
+    return (
+        '<table width="100%" cellspacing="0" cellpadding="0" '
+        f'data-message-side="{side}"><tr>{cells}</tr></table><br>'
     )
 
 

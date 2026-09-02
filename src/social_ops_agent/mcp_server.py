@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from .execution_policy_channel import read_execution_policy
 from .plugins import PluginInvoker, PluginManager
 from .policy import DEFAULT_EXECUTION_POLICY
 from .settings import LLMSettings
@@ -41,6 +42,13 @@ class PluginToolRuntime:
         self.session_registry = _required_path("SOCIAL_AGENT_SESSION_REGISTRY", file=True)
         self.policy = DEFAULT_EXECUTION_POLICY
         self.download_budget_remaining_bytes = self.policy.max_total_download_mb * 1024 * 1024
+        raw_policy_path = os.getenv("SOCIAL_AGENT_EXECUTION_POLICY_PATH", "").strip()
+        self.execution_policy_path = (
+            Path(raw_policy_path).expanduser().resolve() if raw_policy_path else None
+        )
+        self.active_execution_id: str | None = None
+        self.max_download_posts: int | None = None
+        self.downloaded_post_urls: set[str] = set()
         self.download_lock = asyncio.Lock()
         self.publish_lock = asyncio.Lock()
         self.publish_approval_token = os.getenv("SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN", "")
@@ -56,6 +64,17 @@ class PluginToolRuntime:
             llm_model=settings.model,
             llm_api_key=settings.api_key,
         )
+
+    def refresh_execution_policy(self) -> None:
+        policy = read_execution_policy(self.execution_policy_path)
+        execution_id = policy.execution_id if policy is not None else None
+        if execution_id != self.active_execution_id:
+            self.active_execution_id = execution_id
+            self.downloaded_post_urls.clear()
+            self.download_budget_remaining_bytes = (
+                self.policy.max_total_download_mb * 1024 * 1024
+            )
+        self.max_download_posts = policy.max_download_posts if policy is not None else None
 
 
 _runtime: PluginToolRuntime | None = None
@@ -185,13 +204,25 @@ async def download_media(
     """Download posts, or one complete Telegram channel with checkpoints."""
     tool_runtime = runtime()
     async with tool_runtime.download_lock:
+        tool_runtime.refresh_execution_policy()
+        unique_urls = list(dict.fromkeys(urls))[: tool_runtime.policy.max_download_urls_per_call]
+        if telegram_scope != "channel" and tool_runtime.max_download_posts is not None:
+            remaining_posts = max(
+                0,
+                tool_runtime.max_download_posts - len(tool_runtime.downloaded_post_urls),
+            )
+            unique_urls = [
+                url for url in unique_urls if url not in tool_runtime.downloaded_post_urls
+            ][:remaining_posts]
+            if not unique_urls:
+                raise ValueError("the approved post download count is exhausted")
         remaining_mb = tool_runtime.download_budget_remaining_bytes // (1024 * 1024)
         if remaining_mb < 1:
             raise ValueError("the confirmed execution download budget is exhausted")
         output = await tool_runtime.invoker.call(
             "download_media",
             {
-                "urls": urls,
+                "urls": unique_urls,
                 "session_ref": session_ref,
                 "media_format": media_format,
                 "max_total_size_mb": min(max_total_size_mb, remaining_mb),
@@ -201,6 +232,8 @@ async def download_media(
         )
         if not isinstance(output, dict):
             raise ValueError("download plugin returned a non-object result")
+        if telegram_scope != "channel":
+            tool_runtime.downloaded_post_urls.update(unique_urls)
         used_bytes = sum(
             int(item.get("size_bytes") or 0)
             for item in output.get("artifacts", [])
@@ -211,6 +244,15 @@ async def download_media(
         )
         output["execution_download_budget_remaining_mb"] = round(
             tool_runtime.download_budget_remaining_bytes / (1024 * 1024), 2
+        )
+        output["execution_max_download_posts"] = tool_runtime.max_download_posts
+        output["execution_download_posts_remaining"] = (
+            None
+            if tool_runtime.max_download_posts is None
+            else max(
+                0,
+                tool_runtime.max_download_posts - len(tool_runtime.downloaded_post_urls),
+            )
         )
         return output
 

@@ -17,6 +17,11 @@ TELEGRAM_SESSION = SelectedSession(
     platform="telegram",
     profile_name="Telegram 账号 01",
 )
+XIAOHONGSHU_SESSION = SelectedSession(
+    session_ref="sess_xhs_abcdefghijklmnopqrstuvwx",
+    platform="xiaohongshu",
+    profile_name="小红书账号 01",
+)
 
 
 def test_plans_keyword_search_and_one_hundred_downloads() -> None:
@@ -83,6 +88,34 @@ def test_plans_one_random_douyin_post_from_recommendation_feed() -> None:
     assert plan.limit == 1
     assert plan.download is True
     assert plan.tool_call_budget == 2
+
+
+@pytest.mark.parametrize(
+    "wording",
+    ("下载第一条", "下载第一个帖子", "下载首条", "下载前一条"),
+)
+def test_chinese_first_result_wording_downloads_exactly_one_post(wording: str) -> None:
+    planner = ConversationalPlanner()
+
+    plan = planner.create_plan(
+        f"在小红书上搜索 美女，并{wording}",
+        XIAOHONGSHU_SESSION,
+    )
+
+    assert plan.platform == "xiaohongshu"
+    assert plan.query == "美女"
+    assert plan.limit == 1
+    assert plan.download is True
+    assert plan.tool_call_budget == 2
+
+
+def test_chinese_count_wording_is_supported() -> None:
+    plan = ConversationalPlanner().create_plan(
+        "在小红书上搜索 美女，并下载前十二条帖子",
+        XIAOHONGSHU_SESSION,
+    )
+
+    assert plan.limit == 12
 
 
 def test_model_fallback_sends_configured_bearer_key(

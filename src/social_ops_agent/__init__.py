@@ -19,6 +19,7 @@ from .agent_runtime import (
     RuntimePlan,
     RuntimeRouter,
 )
+from .conversation import ConversationCoordinator, ConversationSnapshot, ConversationTurn
 from .harness_backend import DeepSeekHarnessBackend, HarnessExecutionResult
 from .planner import (
     ConversationalPlanner,
@@ -44,6 +45,9 @@ __all__ = [
     "AttachmentModality",
     "AgentRuntime",
     "ConversationalPlanner",
+    "ConversationCoordinator",
+    "ConversationSnapshot",
+    "ConversationTurn",
     "DeepSeekHarnessBackend",
     "DeepSeekHarnessRuntime",
     "DeterministicAgentRuntime",

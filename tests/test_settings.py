@@ -16,8 +16,10 @@ from social_ops_agent.settings import (
 class MemoryCredentials:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
+        self.get_calls = 0
 
     def get(self, account: str) -> str | None:
+        self.get_calls += 1
         return self.values.get(account)
 
     def set(self, account: str, value: str) -> None:
@@ -49,6 +51,25 @@ def test_remote_key_is_kept_out_of_settings_json(tmp_path: Path) -> None:
     assert "sk-private-value" not in (tmp_path / "llm.json").read_text(encoding="utf-8")
     assert credentials.values["openai"] == "sk-private-value"
     assert store.load() == settings
+
+
+def test_startup_metadata_load_does_not_open_credential_store(tmp_path: Path) -> None:
+    credentials = MemoryCredentials()
+    store = LLMSettingsStore(tmp_path / "llm.json", credentials=credentials)
+    settings = LLMSettings.create(
+        provider=LLMProvider.OPENAI,
+        base_url="https://api.openai.com/v1",
+        model="gpt-5.4-mini",
+        api_key="sk-private-value",
+    )
+    store.save(settings)
+
+    metadata = store.load_metadata()
+
+    assert metadata.api_key == ""
+    assert credentials.get_calls == 0
+    assert store.with_secret(metadata) == settings
+    assert credentials.get_calls == 1
 
 
 def test_openai_requires_https_and_api_key() -> None:

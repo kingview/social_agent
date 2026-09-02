@@ -60,21 +60,21 @@ def _router(tmp_path: Path) -> RuntimeRouter:
     )
 
 
-def test_router_selects_harness_for_dynamic_task(tmp_path: Path) -> None:
+def test_router_selects_harness_for_every_natural_language_task(tmp_path: Path) -> None:
     router = _router(tmp_path)
     fixed = FakeRuntime(plan=_fixed_plan())
     harness = FakeRuntime(plan=_dynamic_plan())
     router._deterministic = lambda: fixed  # type: ignore[method-assign]
     router._harness = lambda: harness  # type: ignore[method-assign]
 
-    plan = router.propose("搜索 web3 并分析、生成文案", SESSION)
+    plan = router.propose("搜索 web3 并下载第一条", SESSION)
 
     assert isinstance(plan, DynamicAgentPlan)
     assert harness.proposals == 1
     assert fixed.proposals == 0
 
 
-def test_router_falls_back_to_harness_when_fixed_parser_cannot_plan(tmp_path: Path) -> None:
+def test_router_does_not_consult_fixed_parser(tmp_path: Path) -> None:
     router = _router(tmp_path)
     fixed = FakeRuntime(error=PlanningError("not fixed"))
     harness = FakeRuntime(plan=_dynamic_plan())
@@ -82,7 +82,7 @@ def test_router_falls_back_to_harness_when_fixed_parser_cannot_plan(tmp_path: Pa
     router._harness = lambda: harness  # type: ignore[method-assign]
 
     assert isinstance(router.propose("完成一个非固定任务", SESSION), DynamicAgentPlan)
-    assert fixed.proposals == 1
+    assert fixed.proposals == 0
     assert harness.proposals == 1
 
 

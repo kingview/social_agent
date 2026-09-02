@@ -170,6 +170,7 @@ class DynamicAgentPlan(BaseModel):
     steps: list[str] = Field(min_length=1, max_length=12)
     attachments: list[AgentAttachment] = Field(default_factory=list, max_length=8)
     media_context: str | None = Field(default=None, max_length=80_000)
+    max_download_posts: int | None = Field(default=None, ge=1, le=100)
     write_actions: list[Literal["publish_x"]] = Field(default_factory=list, max_length=1)
     max_tool_calls: int = Field(default=20, ge=1, le=200)
     requires_confirmation: bool = False

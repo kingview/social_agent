@@ -405,7 +405,8 @@ LangChain 类型不得进入核心领域模型、数据库结构或执行协议�
 - 当前选中的端点、模型和进程内凭据会注入 Planning Cordis、Execution Cordis 及其 MCP 插件进程，避免规划、附件分析和文案生成意外使用不同模型。
 - 非敏感设置写入用户级 `llm-settings.json`；远端 API Key 仅存入 macOS Keychain 或 Windows Credential Manager。OpenAI API 使用独立 Platform API Key，不复用 ChatGPT 消费者订阅或登录会话。
 - Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
-- GUI 的一个会话复用同一组 Planning/Execution Harness 进程；Planning session 和 Execution session 分别保持稳定 ID，避免每轮新建进程导致原生上下文丢失。
+- `ConversationCoordinator` 是桌面会话状态的唯一所有者，将 conversation ID、用户请求、计划、运行状态、失败阶段、执行结果和最近 `session_ref` 原子写入 `.social-agent-state/conversations/active.json`。App 重启后恢复相同 conversation ID；退出前仍处于 planning/planned/executing 的轮次会被恢复为可重试的 interrupted failure。同一次 App 运行内，Planning 与 Execution Harness 复用稳定 session ID；App 重启后使用新的 runtime epoch，并在 20,000 字符预算内按时间顺序回放尽可能多的最近结构化轮次，避免直接恢复旧 Harness session 导致空事件。因此“重试”“继续”和省略主语的后续命令在进程内读取 Harness 原生历史，跨重启读取协调器持久历史。
+- 每轮执行前，`ExecutionPolicyChannel` 以新的 execution ID 原子写入短生命周期本地授权；常驻 MCP 在每次下载调用前重新读取，并按 execution ID 重置帖子数、URL 去重集合和容量预算。授权在该轮结束后撤销，因此无需牺牲 Execution 上下文来隔离数量限制。X 发布仍使用带一次性令牌的独立 Execution/MCP 进程。
 - 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
 
 Harness 是可替换的 `AgentRuntimeAdapter`，其 JSON-RPC event、MCP 名称和内部 session 不能成为跨服务领域协议。升级 Release Candidate 前必须运行契约测试、Tool 白名单测试、无工具规划测试和真实模型冒烟测试。
@@ -414,19 +415,22 @@ Harness 是可替换的 `AgentRuntimeAdapter`，其 JSON-RPC event、MCP 名称�
 
 ```text
 RuntimeRouter
-├── DeterministicAgentRuntime
-│   └── SocialOperationsAgent
 └── DeepSeekHarnessRuntime
     └── DeepSeekHarnessBackend → JSON-RPC → Cordis → MCP
 
+兼容代码（GUI 不再路由）：
+└── legacy_runtime.DeterministicAgentRuntime → SocialOperationsAgent
+
 共享：
+├── ConversationCoordinator
 ├── ExecutionPolicy
+├── ExecutionPolicyChannel
 ├── LLMSettings
 ├── AgentProgress
 └── AgentExecutionResult
 ```
 
-Qt Worker 只调用 `RuntimeRouter.propose/execute/cancel`，不导入具体 Tool 或创建 Harness Backend。`ExecutionPolicy` 是浏览数量、批次、总下载量与 Tool 次数的应用层权威限制；Prompt 和 Tool Schema 只能进一步收紧，不能放宽。`LLMSettingsStore` 读取 GUI 设置并通过系统凭据存储恢复密钥，`LLMSettings` 再作为不可变快照注入 `RuntimeRouter`。切换来源时关闭旧 Harness 进程并用相同 GUI 会话 ID 重建 Runtime；已经生成但尚未执行的计划同时作废，防止跨模型执行。`SOCIAL_AGENT_LLM_*` 通用变量仍用于部署覆盖，并兼容旧 `SOCIAL_AGENT_OLLAMA_*` 变量。
+Qt Worker 只调用 `ConversationCoordinator` 和 `RuntimeRouter.propose/execute/cancel`，不导入具体 Tool 或创建 Harness Backend。`conversation.py` 负责可恢复状态，`harness_prompts.py` 负责 Planning/Execution 提示及 Harness 原生图片块，`execution_policy_channel.py` 负责逐轮授权，`legacy_runtime.py` 隔离固定工作流兼容代码。所有 GUI 自然语言命令均进入 Harness；确定性代码只负责策略拒绝、Pydantic 契约、平台会话匹配和执行上限。`ExecutionPolicy` 是浏览数量、单批 URL、整次任务下载帖子数、总下载量与 Tool 次数的应用层权威限制；Prompt 和 Tool Schema 只能进一步收紧，不能放宽。Planning Cordis 输出 `max_download_posts`，用户文字中明确出现的“第一条/第一个/首条/前 N 条”还会转换为不可放宽的授权上限；Execution MCP 再按该上限截断 URL，并拒绝后续新增 URL。`LLMSettingsStore` 读取 GUI 设置并通过系统凭据存储恢复密钥，`LLMSettings` 再作为不可变快照注入 `RuntimeRouter`。切换来源时关闭旧 Harness 进程并用相同 conversation ID 重建 Runtime；已经生成但尚未执行的计划同时作废，防止跨模型执行。`SOCIAL_AGENT_LLM_*` 通用变量仍用于部署覆盖，并兼容旧 `SOCIAL_AGENT_OLLAMA_*` 变量。
 
 #### 6.3.1 Harness 多模态与上下文边界
 
@@ -591,7 +595,7 @@ tools/
 
 `browser.operate` 补足无法预先固化的平台页面流程。比特浏览器官方 Local API 负责 Profile 生命周期：健康检查、列表/详情、创建/修改、打开/关闭、代理和指纹配置等；页面内 DOM 点击、输入和滚动不属于 Local API 端点。Tool 因此只调用 `/browser/open` 获取回环地址上的 WebSocket/HTTP CDP 端点，再由 Playwright 操作该 Profile 中的可见标签页。支持 `observe`、`navigate`、`click`、`input`、`press`、`scroll`、`back`、`forward`、`reload` 和 `wait`；`observe` 返回短期 `element_ref`，供后续动作复用。导航仅接受公开 HTTPS 地址；禁止密码、验证码、密钥和文件输入，并在点击前拦截发布、互动、交易、账户变更及删除类控件。每个 `session_ref` 串行操作，目标标签页和元素引用仅保留在本机进程内，页面正文仍按不可信输入处理。当前版本不调用 `/browser/add`、`/browser/modify`、`/browser/close`、`/browser/delete` 或代理批量修改接口，Profile、代理和指纹继续由用户在比特浏览器中预配置。
 
-本地 `Social Agent` Client 提供会话式任务入口。自然语言先经过策略拒绝检查，再转换成固定 `AgentPlan` 或 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条，批量下载按每批最多 20 URL 执行。计划必须在 GUI 中人工确认后才调用 Tool。常规搜索下载继续使用确定性有限状态 Runtime；“逐步点击/输入/翻页、下载后分析、按观察继续搜索、筛选、总结、生成文案、发布到 X”等非固定路径进入 DeepSeek Harness。X 发布计划在执行前显示独立外部写确认框。规划阶段使用无 Tool Cordis，确认后使用仅含已安装、已启用插件能力的 MCP Tool Bridge；两条路径都保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
+本地 `Social Agent` Client 提供会话式任务入口。所有自然语言先经过策略拒绝检查，再由无 Tool 的 Planning Cordis 转换成 Harness `DynamicAgentPlan`；平台与 `session_ref` 必须匹配，单次浏览最多 100 条、单次下载调用最多 20 URL，并另外执行整次任务的帖子数上限。随后由只含已安装、已启用插件能力的 Execution Cordis/MCP Tool Bridge 执行搜索下载、逐步点击/输入/翻页、分析、筛选、总结、生成文案和可选 X 发布。X 发布计划在执行前显示独立外部写确认框。确定性有限状态 Runtime 仅保留为兼容实现，不再接收 GUI 自然语言命令。所有路径保持 Pydantic 契约、审计、输出目录和原文件保留规则。未来服务端可在 `AgentRuntimeAdapter` 后接入 LangGraph，无需重写 Tool。
 
 `media.process_watermark` 与下载器保持分离。下载器始终保存原始 artifact；水印 Tool 用 OpenCV 抽帧检测画面任意位置的持久静态叠加层，并从每个采样帧提取文字/Logo 候选，通过归一化边缘描述子跨帧聚类：同一外观在至少 35% 采样帧中重复、位置变化且相似度达到高置信阈值时，自动判定为动态水印。轨迹不要求从首个采样帧开始，周期滚动水印与固定水印可在同一视频中同时返回。仅在任务明确要求、用户确认授权且候选达到置信度和面积阈值时才生成带 `derived_from_sha256` 的衍生 artifact。默认的本机时序修复不再擦除整个粗检测框：它从多帧持久边缘生成细粒度笔画 mask，以动态候选首次可靠出现的时间点建立模板并向视频前后双向跟踪；局部匹配降级时执行全画面重新定位，以处理滚动水印的循环跳转。随后逐帧 Telea inpaint，并使用稠密光流把上一帧修复结果对齐后仅在 mask 内低比例融合，以降低闪烁和矩形模糊。快速模式保留 FFmpeg `delogo`/矩形 inpaint 作为低成本路径。低置信度、间歇出现或复杂形变候选可在 Watermark Studio 人工框选首帧区域后跟踪，并强制标记为需要人工检查。Social Agent 可将其作为每个下载批次后的可选步骤，原文件禁止覆盖。
 

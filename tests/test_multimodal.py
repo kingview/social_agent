@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from social_ops_agent.contracts import AgentAttachment, DynamicAgentPlan
-from social_ops_agent.harness_backend import _content_blocks
+from social_ops_agent.harness_prompts import content_blocks
 from social_ops_agent.multimodal import MultimodalInputError, prepare_multimodal_input
 
 
@@ -31,7 +31,7 @@ def test_image_is_staged_without_media_plugin_and_encoded_for_harness(tmp_path: 
     assert prepared.media_context is None
     assert prepared.attachments[0].modality == "image"
     assert Path(prepared.attachments[0].path).read_bytes() == PNG_1X1
-    blocks = _content_blocks("prompt", prepared.attachments)
+    blocks = content_blocks("prompt", prepared.attachments)
     assert blocks[0] == {"type": "text", "text": "prompt"}
     assert blocks[1]["type"] == "image"
     assert base64.b64decode(blocks[1]["data"]) == PNG_1X1

@@ -186,22 +186,46 @@ class LLMSettingsStore:
         self.credentials = credentials or SystemCredentialStore()
 
     def load(self) -> LLMSettings:
+        settings = self.load_metadata()
+        if _has_llm_environment_override() or settings.provider is LLMProvider.OLLAMA:
+            return settings
+        return self.with_secret(settings)
+
+    def load_metadata(self) -> LLMSettings:
+        """Load startup-safe settings without opening the OS credential prompt."""
         if _has_llm_environment_override() or not self.path.is_file():
             return LLMSettings.from_env()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             provider = LLMProvider(str(payload["provider"]))
-            api_key = self.api_key(provider)
-            return LLMSettings.create(
+            base_url = _validate_base_url(
+                str(payload["base_url"]),
+                require_https=provider is LLMProvider.OPENAI,
+            )
+            model = str(payload["model"]).strip()
+            if not model or len(model) > 200:
+                raise LLMSettingsError("请输入有效的模型 ID。")
+            return LLMSettings(
                 provider=provider,
-                base_url=str(payload["base_url"]),
-                model=str(payload["model"]),
-                api_key=api_key or "",
+                base_url=base_url,
+                model=model,
+                api_key="local-model" if provider is LLMProvider.OLLAMA else "",
             )
         except LLMSettingsError:
             raise
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise LLMSettingsError("本地 LLM 设置文件损坏，请重新保存模型设置。") from exc
+
+    def with_secret(self, settings: LLMSettings) -> LLMSettings:
+        """Hydrate a remote setting only when an operation actually needs the key."""
+        if settings.provider is LLMProvider.OLLAMA or settings.api_key:
+            return settings
+        return LLMSettings.create(
+            provider=settings.provider,
+            base_url=settings.base_url,
+            model=settings.model,
+            api_key=self.api_key(settings.provider) or "",
+        )
 
     def api_key(self, provider: LLMProvider | str) -> str | None:
         selected = LLMProvider(provider)
