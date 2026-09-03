@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .plugins import PluginError, PluginManager, build_dependency_lock, build_plugin_bundle
+from .diagnostics import install_exception_hooks, record_exception, redact
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    install_exception_hooks("agent-plugin-cli")
     arguments = build_parser().parse_args(argv)
     try:
         if arguments.command == "bundle":
@@ -76,7 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             manager.set_enabled(arguments.plugin_id, False)
             print(f"disabled {arguments.plugin_id}")
     except (OSError, PluginError, ValueError) as exc:
-        print(f"error: {exc}")
+        record_exception("agent-plugin-cli", f"plugin_cli.{arguments.command}", exc)
+        print(f"error: {redact(str(exc))}")
         return 1
     return 0
 

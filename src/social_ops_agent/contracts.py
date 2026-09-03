@@ -206,6 +206,7 @@ class DynamicAgentPlan(BaseModel):
     media_context: str | None = Field(default=None, max_length=80_000)
     max_download_posts: int | None = Field(default=None, ge=1, le=100)
     write_actions: list[Literal["publish_x"]] = Field(default_factory=list, max_length=1)
+    publish_media_required: bool | None = Field(default=None, strict=True)
     max_tool_calls: int = Field(default=20, ge=1, le=200)
     requires_confirmation: bool = False
 

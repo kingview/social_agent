@@ -19,6 +19,14 @@ def plan():
     )
 
 
+def fixture_registry(tmp_path):
+    (tmp_path / "sessions.json").write_text(json.dumps({"sessions": [{
+        "session_ref": "sess_x_abcdefghijklmnopqrstuvwx", "platform": "x", "provider": "bitbrowser",
+        "profile_id": "fixture-tracking-profile", "profile_name": "fixture X",
+        "api_url": "http://127.0.0.1:54345", "created_at": "now", "updated_at": "now",
+    }]}))
+
+
 def result_event(call_id, payload, error=False):
     return {"type": "tool/result", "data": {"message": {"content": [{
         "type": "tool-result", "toolCallId": call_id, "isError": error,
@@ -80,6 +88,7 @@ def test_no_credit_for_empty_partial_or_unconfirmed_results(tool, payload):
 
 @pytest.mark.parametrize("state", [None, "failed", "unknown", "published"])
 def test_runtime_and_conversation_preserve_actual_completion(tmp_path, monkeypatch, state):
+    fixture_registry(tmp_path)
     backend = DeepSeekHarnessBackend(registry_path=tmp_path / "sessions.json", output_root=tmp_path,
                                     conversation_id="test", project_root=tmp_path)
     grants = []
@@ -89,6 +98,13 @@ def test_runtime_and_conversation_preserve_actual_completion(tmp_path, monkeypat
             payload = json.loads(content_blocks[0]["text"])
             grants.append(bool(payload["x_publish_approval_token"]))
             for event in events(state):
+                if event["type"] == "tool/call" and event["data"]["name"].endswith("publish_x_post"):
+                    # A real core MCP reserves before calling the plugin, and
+                    # writes the result before emitting the tool-result event.
+                    from social_ops_agent.execution_policy_channel import read_execution_policy
+                    grant = read_execution_policy(backend.execution_policy_path)
+                    backend.task_store.reserve_publish(grant.task_id, grant.execution_id)
+                    backend.task_store.publish_result(grant.task_id, grant.execution_id, state)
                 on_event(event)
             return HarnessTurnResult(session_id, "模型声称全部完成", "completed", [], [])
 
@@ -154,3 +170,75 @@ def test_invalid_step_binding_and_partial_batch_do_not_complete_a_step():
     tracker.returned(result_event("partial", {"items": [{"artifacts": ["file"]}, {"error": "failed"}],
                                                "artifacts": ["file"]})["data"])
     assert not tracker.completed
+
+
+@pytest.mark.parametrize("serialized", [True, False])
+def test_native_arguments_replay_completes_four_steps_before_rejected_publish(serialized):
+    tracker = ExecutionTracker(plan())
+    stages = [("browse_posts", {"posts": ["post"]}), ("download_media", {"artifacts": ["file"]}),
+              ("analyze_content", {"summary": "分析"}), ("generate_post_copy", {"variants": ["草稿"]})]
+    for index, (tool, result) in enumerate(stages, 1):
+        args = {"step_id": f"step-{index}", "step_item_id": "item-1"}
+        tracker.called({"callId": f"call-{index}", "name": f"mcp__social__{tool}",
+                        "arguments": json.dumps(args) if serialized else args})
+        tracker.returned(result_event(f"call-{index}", result)["data"])
+    tracker.called({"callId": "publish", "name": "mcp__social__publish_x_post",
+                    "arguments": json.dumps({"step_id": "step-5", "step_item_id": "item-1"})})
+    tracker.returned(result_event("publish", {"error": "approval missing"}, True)["data"])
+    tracker.reconcile_publication("not_attempted")
+    result = tracker.finish(normal_end=True)
+    assert result.completed == 4 and result.total == 5
+    assert tracker.publish_state == "not_attempted"
+    assert all(row["step_id"] for row in tracker.call_records.values())
+
+
+@pytest.mark.parametrize("raw", ['{"step_id":', '[]', 'null', '"text"', 7, [],
+    '{"step_id":"step-2","step_item_id":[]}', {"step_id": {"id": "step-2"}}])
+def test_malformed_native_arguments_cannot_receive_step_credit(raw):
+    tracker = ExecutionTracker(plan())
+    tracker.called({"callId": "bad", "name": "mcp__social__download_media", "arguments": raw})
+    tracker.returned(result_event("bad", {"artifacts": ["file"]})["data"])
+    assert not tracker.completed
+
+
+def test_serialized_repeated_tool_arguments_remain_bound_to_their_own_steps():
+    tracker = ExecutionTracker(DynamicAgentPlan(objective="两批文案", summary="两批文案",
+        steps=["甲", "乙"], step_tools=["generate_post_copy", "generate_post_copy"]))
+    for call, step in [("a", "step-1"), ("b", "step-2")]:
+        tracker.called({"callId": call, "name": "mcp__social__generate_post_copy",
+                        "arguments": json.dumps({"step_id": step})})
+    tracker.returned(result_event("b", {"variants": ["乙"]})["data"])
+    assert tracker.completed == {1}
+    tracker.returned(result_event("a", {"variants": ["甲"]})["data"])
+    assert tracker.completed == {0, 1}
+
+
+def test_backend_and_gui_record_preflight_failure_as_not_attempted(tmp_path, monkeypatch):
+    fixture_registry(tmp_path)
+    coordinator = ConversationCoordinator(tmp_path / ".social-agent-state")
+    execution_plan = plan()
+    task_id = coordinator.begin_turn(execution_plan.objective)
+    execution_plan = execution_plan.model_copy(update={"task_id": task_id})
+    coordinator.mark_planned(task_id, execution_plan)
+    backend = DeepSeekHarnessBackend(registry_path=tmp_path / "sessions.json", output_root=tmp_path,
+        conversation_id=coordinator.conversation_id, project_root=tmp_path)
+
+    class Client:
+        def run_turn(self, *, session_id, on_event, **kwargs):
+            for event in events(None):
+                on_event(event)
+            on_event({"type": "tool/call", "data": {"callId": "publish",
+                "name": "mcp__social__publish_x_post", "arguments": '{"step_id":"step-5"}'}})
+            # The core rejected the request before its reservation boundary.
+            on_event(result_event("publish", {"error": "approval invalid"}, True))
+            return HarnessTurnResult(session_id, "授权校验失败，未提交", "completed", [], [])
+
+    monkeypatch.setattr(backend, "_start_client", lambda **kwargs: Client())
+    result = _harness_result(backend.execute(execution_plan))
+    assert result.completed_steps == 4 and result.completion_status == "partial"
+    assert result.publish_state == "not_attempted"
+    coordinator.mark_succeeded(task_id, result)
+    restored = ConversationCoordinator(coordinator.state_root)
+    assert not restored.turns[-1].publish_attempted
+    assert restored.last_result().publish_state == "not_attempted"
+    assert not restored.task_store.history(restored.conversation_id)[-1].publish_attempted

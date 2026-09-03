@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -14,6 +15,8 @@ from typing import Any, Literal
 
 from mcp import StdioServerParameters
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .diagnostics import current_context, diagnostic_context, log_directory, record_exception
 
 from .plugin_host import (
     PluginEndpoint,
@@ -44,6 +47,7 @@ class PythonRuntime(BaseModel):
 
     module: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.]+$")
     gui_module: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.]+$")
+    task_cleanup_module: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.]+$")
     install_extras: list[str] = Field(default_factory=list)
 
 
@@ -386,12 +390,19 @@ class PluginInvoker:
         self.host = host or default_plugin_host()
 
     async def call(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        record = self.manager.find_tool(tool_name)
-        self._require_runtime(record)
-        try:
-            return await self.host.call(self._endpoint(record), tool_name, arguments)
-        except PluginHostError as exc:
-            raise PluginError(str(exc)) from exc
+        context = current_context()
+        call_id = context.get("tool_call_id") or f"call-{uuid.uuid4().hex}"
+        with diagnostic_context(tool_call_id=call_id, trace_id=context.get("trace_id") or call_id, tool=tool_name):
+            try:
+                record = self.manager.find_tool(tool_name)
+                self._require_runtime(record)
+                try:
+                    return await self.host.call(self._endpoint(record), tool_name, arguments)
+                except PluginHostError as exc:
+                    raise PluginError(str(exc)) from exc
+            except Exception as exc:
+                record_exception("agent", "plugin.invoke", exc, state_root=self.state_root)
+                raise
 
     async def live_catalog(self) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
@@ -463,6 +474,7 @@ class PluginInvoker:
             "POSTDROP_SESSION_REGISTRY": str(self.session_registry),
             "SOCIAL_AGENT_OUTPUT_ROOT": str(self.output_root),
             "SOCIAL_AGENT_STATE_ROOT": str(self.state_root),
+            "SOCIAL_AGENT_LOG_DIR": str(log_directory(self.state_root)),
             "SOCIAL_AGENT_LLM_BASE_URL": self.llm_base_url,
             "SOCIAL_AGENT_LLM_MODEL": self.llm_model,
             "SOCIAL_AGENT_LLM_API_KEY": self.llm_api_key,

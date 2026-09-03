@@ -1,64 +1,31 @@
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from .conversation_models import ConversationSnapshot, ConversationTurn, TurnStatus
+from .conversation_repository import ConversationRepository
 
 from .contracts import AgentExecutionResult, AgentPlan, DynamicAgentPlan
 from .task_store import TaskStore
 
 
-TurnStatus = Literal[
-    "planning",
-    "planned",
-    "executing",
-    "succeeded",
-    "failed",
-    "partial",
-    "cancelled",
-]
-
-
-class ConversationTurn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    turn_id: str = Field(min_length=1, max_length=100)
-    user_message: str = Field(min_length=1, max_length=80_000)
-    attachment_names: list[str] = Field(default_factory=list, max_length=8)
-    session_ref: str | None = Field(default=None, max_length=100)
-    platform: str | None = Field(default=None, max_length=40)
-    status: TurnStatus = "planning"
-    plan: dict | None = None
-    result: dict | None = None
-    error_stage: Literal["planning", "execution", "interrupted"] | None = None
-    error: str | None = Field(default=None, max_length=20_000)
-    publish_attempted: bool = False
-    created_at: str
-    updated_at: str
-
-
-class ConversationSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    version: Literal[1] = 1
-    conversation_id: str = Field(pattern=r"^conversation-[a-f0-9]{32}$")
-    created_at: str
-    updated_at: str
-    turns: list[ConversationTurn] = Field(default_factory=list, max_length=200)
-
-
 class ConversationCoordinator:
     """GUI transcript and compact model context; TaskStore owns execution facts."""
 
-    def __init__(self, state_root: Path) -> None:
+    def __init__(self, state_root: Path, *, conversation_id: str | None = None,
+                 create_new: bool = False) -> None:
         self.state_root = state_root.expanduser().resolve()
-        self.path = self.state_root / "conversations" / "active.json"
+        self.repository = ConversationRepository(self.state_root)
         self.task_store = TaskStore(self.state_root)
-        self.snapshot = self._load() or self._fresh_snapshot()
+        loaded = None if create_new else (
+            self.repository.load(conversation_id) if conversation_id is not None
+            else self.repository.default()
+        )
+        if conversation_id is not None and loaded is None:
+            raise ValueError("Conversation does not exist or its ID does not match")
+        self.snapshot = loaded or self._fresh_snapshot()
+        self.path = self.repository.path(self.conversation_id)
         for turn in self.snapshot.turns:
             self.task_store.import_turn(self.conversation_id, turn.model_dump(mode="json"))
             self._sync_execution(turn)
@@ -66,6 +33,10 @@ class ConversationCoordinator:
             self._save()
         elif not self.path.is_file():
             self._save()
+
+    @classmethod
+    def catalog(cls, state_root: Path) -> list[ConversationSnapshot]:
+        return ConversationRepository(state_root).catalog()
 
     @property
     def conversation_id(self) -> str:
@@ -77,6 +48,7 @@ class ConversationCoordinator:
 
     def new_conversation(self) -> str:
         self.snapshot = self._fresh_snapshot()
+        self.path = self.repository.path(self.conversation_id)
         self._save()
         return self.snapshot.conversation_id
 
@@ -210,7 +182,7 @@ class ConversationCoordinator:
         report = self.task_store.execution(turn.turn_id)
         if not report:
             return
-        turn.publish_attempted = turn.publish_attempted or report["publish_attempted"]
+        turn.publish_attempted = report["publish_attempted"]
         if report["state"] == "executing" or not turn.plan:
             return
         turn.status = report["state"]
@@ -227,26 +199,9 @@ class ConversationCoordinator:
             turn.error_stage = "execution"
             turn.error = report["error"]
 
-    def _load(self) -> ConversationSnapshot | None:
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            return ConversationSnapshot.model_validate(payload)
-        except (FileNotFoundError, OSError, json.JSONDecodeError, ValidationError):
-            return None
-
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.snapshot.updated_at = _timestamp()
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(
-                self.snapshot.model_dump(mode="json"),
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        self.repository.save(self.snapshot)
 
     @staticmethod
     def _fresh_snapshot() -> ConversationSnapshot:

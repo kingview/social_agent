@@ -30,6 +30,7 @@ if [[ -z "$plugin_python" || ! -x "$plugin_python" ]]; then
 fi
 
 mkdir -p "$output_dir"
+"$python_bin" "$project_dir/scripts/sync_diagnostics.py" --tools-root "$tools_dir"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
 

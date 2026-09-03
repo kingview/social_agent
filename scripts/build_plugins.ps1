@@ -20,6 +20,8 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $ProjectDirectory "dist\plugins"
 }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+& $Python (Join-Path $PSScriptRoot "sync_diagnostics.py") --tools-root $ToolsDirectory
+if ($LASTEXITCODE -ne 0) { throw "Failed to synchronize Tool diagnostics" }
 
 $TemporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("social-agent-plugins-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $TemporaryDirectory | Out-Null

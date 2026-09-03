@@ -249,7 +249,11 @@ def test_execution_harness_stays_alive_across_retry_turns_and_policy_rotates(
     tmp_path,
 ) -> None:
     registry_path = tmp_path / "sessions.json"
-    registry_path.write_text('{"sessions":[]}', encoding="utf-8")
+    registry_path.write_text(json.dumps({"sessions": [{
+        "session_ref": "sess_xhs_abcdefghijklmnopqrstuvwx", "platform": "xiaohongshu",
+        "provider": "bitbrowser", "profile_id": "fixture-profile", "profile_name": "测试窗口",
+        "api_url": "http://127.0.0.1:54345", "created_at": "now", "updated_at": "now",
+    }]}), encoding="utf-8")
     backend = DeepSeekHarnessBackend(
         registry_path=registry_path,
         output_root=tmp_path / "output",

@@ -57,6 +57,10 @@
       SOCIAL_AGENT_SESSION_REGISTRY: !!js process.env.SOCIAL_AGENT_SESSION_REGISTRY
       SOCIAL_AGENT_OUTPUT_ROOT: !!js process.env.SOCIAL_AGENT_OUTPUT_ROOT
       SOCIAL_AGENT_STATE_ROOT: !!js process.env.SOCIAL_AGENT_STATE_ROOT
+      SOCIAL_AGENT_EXECUTION_POLICY_PATH: !!js process.env.SOCIAL_AGENT_EXECUTION_POLICY_PATH ?? ''
+      # Harness deliberately scrubs ambient credential variables. Forward only
+      # this task's one-shot grant explicitly; never disable upstream scrubbing.
+      SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN: !!js process.env.SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN ?? ''
       SOCIAL_AGENT_PLUGIN_ROOT: !!js process.env.SOCIAL_AGENT_PLUGIN_ROOT
       SOCIAL_AGENT_LLM_API_KEY: !!js process.env.SOCIAL_AGENT_LLM_API_KEY
       SOCIAL_AGENT_LLM_BASE_URL: !!js process.env.SOCIAL_AGENT_LLM_BASE_URL

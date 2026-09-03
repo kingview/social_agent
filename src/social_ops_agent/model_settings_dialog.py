@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import record_exception
+
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -39,6 +41,7 @@ class ModelProbeWorker(QThread):
         try:
             models = self.settings.list_models()
         except Exception as exc:
+            record_exception("agent", "model_settings_dialog.handled", exc)
             self.failed.emit(str(exc).strip() or type(exc).__name__)
         else:
             self.succeeded.emit(models)
@@ -214,6 +217,7 @@ class ModelSettingsDialog(QDialog):
         try:
             stored = bool(self.store.api_key(provider))
         except LLMSettingsError as exc:
+            record_exception("agent", "model_settings_dialog.handled", exc)
             stored = False
             self.status_label.setText(str(exc))
         self.key_input.setPlaceholderText(
@@ -249,6 +253,7 @@ class ModelSettingsDialog(QDialog):
         try:
             settings = self._settings()
         except LLMSettingsError as exc:
+            record_exception("agent", "model_settings_dialog.handled", exc)
             QMessageBox.warning(self, "模型设置不完整", str(exc))
             return
         self._set_busy(True)
@@ -299,6 +304,7 @@ class ModelSettingsDialog(QDialog):
             settings = self._settings()
             self.store.save(settings)
         except LLMSettingsError as exc:
+            record_exception("agent", "model_settings_dialog.handled", exc)
             QMessageBox.warning(self, "无法保存模型设置", str(exc))
             return
         self.selected_settings = settings

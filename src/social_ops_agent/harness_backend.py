@@ -7,6 +7,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+from threading import Event
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -19,6 +20,9 @@ from .contracts import (
     DynamicAgentPlan,
 )
 from .execution_policy_channel import ExecutionPolicyChannel
+from .browser_cleanup import cleanup_task_browsers
+from .browser_scheduler import BrowserTaskScheduler, BrowserWaitCancelled, resources_for_plan
+from .execution_lifecycle import ExecutionLifecycle
 from .execution_tracking import ExecutionTracker
 from .harness_client import (
     HarnessError,
@@ -37,6 +41,7 @@ from .harness_prompts import (
 from .planner import SelectedSession, requested_download_limit
 from .plugins import default_plugin_root
 from .policy import DEFAULT_EXECUTION_POLICY, ExecutionPolicy
+from .diagnostics import record_exception, register_secrets
 from .settings import LLMSettings
 from .task_intent import resolve_write_actions
 from .task_store import TaskRecord, TaskStore
@@ -97,6 +102,9 @@ class DeepSeekHarnessBackend:
         self._runtime_epoch = secrets.token_hex(6)
         self._plan_generation = 0
         self._execute_generation = 0
+        self._cancel_requested = Event()
+        self._cancelled_client: HarnessJsonRpcClient | None = None
+        self.browser_scheduler = BrowserTaskScheduler()
 
     @staticmethod
     def is_available(project_root: Path | None = None) -> tuple[bool, str]:
@@ -126,6 +134,9 @@ class DeepSeekHarnessBackend:
                 task_history=history,
             ).model_copy(update={"task_id": task_id})
         except BaseException as exc:
+            register_secrets(self.settings.api_key)
+            record_exception("agent", "harness.planning", exc, state_root=self.state_root,
+                             task_id=task_id, conversation_id=self.conversation_id)
             self.task_store.planning_failed(task_id, str(exc))
             raise
         self.task_store.set_plan(task_id, plan.model_dump(mode="json"))
@@ -175,6 +186,9 @@ class DeepSeekHarnessBackend:
                     require_step_tools=True,
                 )
             except (HarnessError, ValidationError) as exc:
+                register_secrets(self.settings.api_key)
+                record_exception("agent", "harness.planning_repair", exc,
+                    state_root=self.state_root, conversation_id=self.conversation_id)
                 repair_turn = client.run_turn(
                     session_id=plan_session_id,
                     prompt=planning_repair_prompt(
@@ -228,24 +242,67 @@ class DeepSeekHarnessBackend:
             if progress is not None:
                 progress(event)
 
+        def waiting(label, owner):
+            owner_label = f"对话 {owner[-6:]}" if owner else "其他任务"
+            notify(AgentProgress(stage="waiting_browser", completed=0, total=len(plan.steps),
+                message=f"等待浏览器窗口「{label}」：{owner_label} 正在使用，释放后会自动继续。"))
+
+        def finish_runtime(failed):
+            try:
+                if failed or plan.write_actions or self._cancel_requested.is_set():
+                    self._drop_client("execute")
+            finally:
+                self._active_client = None
+                self._join_cancelled_runtime()
+
+        lifecycle = ExecutionLifecycle(scheduler=self.browser_scheduler,
+            policy_channel=self.execution_policy_channel, plan=plan, execution_id=execution_id,
+            conversation_id=self.conversation_id, cancelled=self._cancel_requested,
+            finish_runtime=finish_runtime,
+            report_error=lambda exc: record_exception("agent", "harness.teardown", exc,
+                state_root=self.state_root, task_id=task_id, execution_id=execution_id,
+                conversation_id=self.conversation_id))
         try:
-            result = self._execute(plan, execution_id=execution_id, tracker=tracker, progress=notify)
-            state = "succeeded" if result.completion_status == "completed" else result.completion_status
+            with lifecycle:
+                lifecycle.acquire(lambda: resources_for_plan(plan, self.registry_path), on_wait=waiting)
+                result = self._execute(plan, execution_id=execution_id, tracker=tracker, progress=notify)
+                lifecycle.stop_runtime()
+                if result.completion_status == "completed" and not result.cancelled:
+                    resources = self.state_root / "browser-resources" / execution_id
+                    if resources.is_dir():
+                        notify(AgentProgress(stage="cleanup", completed=len(plan.steps), total=len(plan.steps),
+                                             message="任务已完成，正在关闭本次新开的浏览器窗口和标签页…"))
+                        cleaned = cleanup_task_browsers(self.state_root, execution_id)
+                        result.warnings.extend(cleaned["warnings"])
+                        detail = (f"已清理本次任务的 {cleaned['closed_tabs']} 个标签页、"
+                                  f"{cleaned['closed_windows']} 个浏览器窗口。")
+                        if cleaned["warnings"]:
+                            detail += "\n" + "\n".join(cleaned["warnings"])
+                        result.response = (result.response + "\n\n" + detail).strip()
+                state = "cancelled" if result.cancelled else "succeeded" if result.completion_status == "completed" else result.completion_status
+                self.task_store.checkpoint(task_id, execution_id,
+                    {**tracker.report(), "summary": result.user_summary(), "warnings": result.warnings, "cancelled": result.cancelled,
+                     "completion_status": result.completion_status, "finish_reason": result.finish_reason}, state=state)
+                return result
+        except BrowserWaitCancelled:
+            result = HarnessExecutionResult(plan=plan, response="已取消等待浏览器窗口，未开始执行任务。",
+                session_id="", tool_calls=[], cancelled=True, completion_status="failed",
+                total_steps=len(plan.steps), finish_reason="cancelled")
             self.task_store.checkpoint(task_id, execution_id,
-                {**tracker.report(), "summary": result.user_summary(), "warnings": result.warnings,
-                 "completion_status": result.completion_status, "finish_reason": result.finish_reason}, state=state)
+                {**tracker.report(), "summary": result.response, "cancelled": True,
+                 "completion_status": "failed", "finish_reason": "cancelled"}, state="cancelled")
             return result
         except BaseException as exc:
+            register_secrets(self.settings.api_key)
+            record_exception("agent", "harness.execution", exc, state_root=self.state_root,
+                             task_id=task_id, execution_id=execution_id, conversation_id=self.conversation_id)
+            if plan.write_actions:
+                tracker.reconcile_publication(self.task_store.execution(task_id)["publish_state"])
             self.task_store.checkpoint(task_id, execution_id,
                 {**tracker.report(), "error": str(exc),
                  "completion_status": "partial" if tracker.completed else "failed"},
                 state="partial" if tracker.completed else "failed")
             raise
-        finally:
-            self._active_client = None
-            self.execution_policy_channel.revoke(execution_id)
-            if plan.write_actions:
-                self._drop_client("execute")
 
     def _execute(
         self,
@@ -268,15 +325,8 @@ class DeepSeekHarnessBackend:
         )
         write_actions = tuple(plan.write_actions)
         approval_token = secrets.token_urlsafe(32) if write_actions == ("publish_x",) else None
-        self.execution_policy_channel.grant(
-            execution_id,
-            max_download_posts=plan.max_download_posts,
-            allowed_session_refs=[
-                item.session_ref for item in plan.authorized_browser_sessions()
-            ],
-            task_id=plan.task_id,
-            steps=plan.execution_steps(),
-        )
+        if self._cancel_requested.is_set():
+            raise BrowserWaitCancelled("任务已取消，未启动执行模型。")
         if approval_token:
             # X publishing keeps its stronger one-shot process isolation.
             self._drop_client("execute")
@@ -285,6 +335,9 @@ class DeepSeekHarnessBackend:
             publish_approval_token=approval_token,
         )
         self._active_client = client
+        if self._cancel_requested.is_set():
+            client.cancel()
+            raise HarnessError("任务已由用户停止。")
         tool_count = 0
 
         def on_event(event: dict[str, Any]) -> None:
@@ -300,96 +353,96 @@ class DeepSeekHarnessBackend:
                     )
                 notify(tracker.called(data))
             elif event_type == "tool/result" and isinstance(data, dict):
-                notify(tracker.returned(data))
+                update = tracker.returned(data)
+                if plan.write_actions:
+                    tracker.reconcile_publication(self.task_store.execution(plan.task_id)["publish_state"])
+                notify(update.model_copy(update={"completed": len(tracker.completed)}))
 
-        try:
-            execution_session_id = (
-                f"{self.conversation_id}-execute-publish-{execution_id}"
-                if approval_token
-                else (
-                    f"{self.conversation_id}-execute-{self._runtime_epoch}-"
-                    f"{self._execute_generation}"
-                )
+        execution_session_id = (
+            f"{self.conversation_id}-execute-publish-{execution_id}"
+            if approval_token
+            else (
+                f"{self.conversation_id}-execute-{self._runtime_epoch}-"
+                f"{self._execute_generation}"
             )
-            turn = client.run_turn(
-                session_id=execution_session_id,
-                content_blocks=content_blocks(
-                    execution_prompt(
-                        plan,
-                        self.policy,
-                        publish_approval_token=approval_token,
-                    ),
-                    tuple(plan.attachments),
+        )
+        turn = client.run_turn(
+            session_id=execution_session_id,
+            content_blocks=content_blocks(
+                execution_prompt(
+                    plan,
+                    self.policy,
+                    publish_approval_token=approval_token,
                 ),
-                on_event=on_event,
-            )
-            response = turn.final_response.strip()
-            warnings: list[str] = []
-            if not response:
-                response = recover_logged_final_response(
-                    self.session_root / "execute",
-                    execution_session_id,
-                ).strip()
-                if response:
-                    warnings.append(
-                        "Harness 在最终文本生成后异常结束；已从本地会话日志恢复完整结果。"
-                    )
-            if response and turn.finish_reason == "error":
-                failure = recover_logged_turn_error(
-                    self.session_root / "execute",
-                    execution_session_id,
-                )
+                tuple(plan.attachments),
+            ),
+            on_event=on_event,
+        )
+        response = turn.final_response.strip()
+        warnings: list[str] = []
+        if not response:
+            response = recover_logged_final_response(
+                self.session_root / "execute",
+                execution_session_id,
+            ).strip()
+            if response:
                 warnings.append(
-                    "模型在生成最终结果后报告错误"
-                    f"{f'：{failure}' if failure else ''}；结果已保留，执行会话已重置。"
+                    "Harness 在最终文本生成后异常结束；已从本地会话日志恢复完整结果。"
                 )
-                self._drop_client("execute")
-                self._execute_generation += 1
-            if not response:
-                # An idle turn with no assistant message is not a successful task.
-                # Discard only the broken execution process so the next user retry
-                # starts cleanly; the persistent planning session still owns the
-                # conversational intent and can reconstruct the approved plan.
-                self._drop_client("execute")
-                self._execute_generation += 1
-                raise HarnessError(
-                    "Execution Harness 未返回最终总结；执行会话已重置，请重试。"
+        if response and turn.finish_reason == "error":
+            failure = recover_logged_turn_error(
+                self.session_root / "execute",
+                execution_session_id,
+            )
+            warnings.append(
+                "模型在生成最终结果后报告错误"
+                f"{f'：{failure}' if failure else ''}；结果已保留，执行会话已重置。"
+            )
+            self._drop_client("execute")
+            self._execute_generation += 1
+        if not response:
+            # An idle turn with no assistant message is not a successful task.
+            # Discard only the broken execution process so the next user retry
+            # starts cleanly; the persistent planning session still owns the
+            # conversational intent and can reconstruct the approved plan.
+            self._drop_client("execute")
+            self._execute_generation += 1
+            raise HarnessError(
+                "Execution Harness 未返回最终总结；执行会话已重置，请重试。"
+            )
+        if plan.write_actions:
+            tracker.reconcile_publication(self.task_store.execution(plan.task_id)["publish_state"])
+        final_progress = tracker.finish(normal_end=turn.finish_reason not in {"error", "cancelled", "interrupted"})
+        completion_status = (
+            "completed" if final_progress.stage == "done"
+            else "partial" if tracker.completed else "failed"
+        )
+        if completion_status != "completed":
+            warnings.append("未完成步骤：" + "；".join(tracker.unfinished()))
+            if plan.write_actions and tracker.publish_state != "published":
+                warnings.append(
+                    "X 发布未执行。" if tracker.publish_state == "not_attempted"
+                    else "X 发布未获成功确认，不能自动重试，请先核对账号。"
                 )
-            final_progress = tracker.finish(normal_end=turn.finish_reason not in {"error", "cancelled", "interrupted"})
-            completion_status = (
-                "completed" if final_progress.stage == "done"
-                else "partial" if tracker.completed else "failed"
-            )
-            if completion_status != "completed":
-                warnings.append("未完成步骤：" + "；".join(tracker.unfinished()))
-                if plan.write_actions and tracker.publish_state != "published":
-                    warnings.append(
-                        "X 发布未执行。" if tracker.publish_state == "not_attempted"
-                        else "X 发布未获成功确认，不能自动重试，请先核对账号。"
-                    )
-            notify(final_progress)
-            return HarnessExecutionResult(
-                plan=plan,
-                response=response,
-                session_id=turn.session_id,
-                tool_calls=tracker.tool_calls or turn.tool_calls,
-                warnings=list(dict.fromkeys(warnings)),
-                finish_reason=turn.finish_reason,
-                completion_status=completion_status,
-                completed_steps=len(tracker.completed),
-                total_steps=total_steps,
-                publish_state=tracker.publish_state,
-            )
-        finally:
-            self._active_client = None
-            self.execution_policy_channel.revoke(execution_id)
-            if approval_token:
-                # Revoke the one-time write grant even if no Tool was called.
-                self._drop_client("execute")
-
+        notify(final_progress)
+        return HarnessExecutionResult(
+            plan=plan,
+            response=response,
+            session_id=turn.session_id,
+            tool_calls=tracker.tool_calls or turn.tool_calls,
+            warnings=list(dict.fromkeys(warnings)),
+            finish_reason=turn.finish_reason,
+            cancelled=self._cancel_requested.is_set() or turn.finish_reason in {"cancelled", "interrupted"},
+            completion_status=completion_status,
+            completed_steps=len(tracker.completed),
+            total_steps=total_steps,
+            publish_state=tracker.publish_state,
+        )
     def cancel(self) -> None:
+        self._cancel_requested.set()
         if self._active_client is not None:
             active = self._active_client
+            self._cancelled_client = active
             active.cancel()
             for mode, client in list(self._clients.items()):
                 if client is active:
@@ -401,12 +454,20 @@ class DeepSeekHarnessBackend:
                     break
             self._active_client = None
 
+    def _join_cancelled_runtime(self) -> None:
+        client, self._cancelled_client = self._cancelled_client, None
+        if client is not None:
+            client.close()
+
     def close(self) -> None:
         clients = list(self._clients.values())
         self._clients.clear()
         self._active_client = None
-        for client in clients:
-            client.close()
+        try:
+            for client in clients:
+                client.close()
+        finally:
+            self._join_cancelled_runtime()
 
     def _start_client(
         self,
@@ -445,9 +506,10 @@ class DeepSeekHarnessBackend:
             "SOCIAL_AGENT_EXECUTION_POLICY_PATH": str(self.execution_policy_path),
             "SOCIAL_AGENT_PLUGIN_ROOT": str(default_plugin_root()),
             "SOCIAL_AGENT_PYTHONPATH": _pythonpath(self.project_root),
+            # Explicit empty value revokes any credential inherited from the
+            # host environment for planning/read-only executions.
+            "SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN": publish_approval_token or "",
         }
-        if publish_approval_token:
-            env["SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN"] = publish_approval_token
         client = HarnessJsonRpcClient(
             launch_args=[str(_node_executable()), str(_runtime_script(self.project_root))],
             cwd=self.project_root,
@@ -538,6 +600,7 @@ def _validated_dynamic_plan(
             "media_context": media_context,
             "max_download_posts": max_download_posts,
             "write_actions": write_actions,
+            "publish_media_required": payload.get("publish_media_required"),
             "max_tool_calls": min(20, max_tool_calls),
             "requires_confirmation": False,
         }

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from .diagnostics import current_context, diagnostic_context, install_exception_hooks, record_exception
+from .diagnostic_mcp import DiagnosticFastMCP
+
 import asyncio
 import hashlib
 import hmac
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Literal
-
-from mcp.server.fastmcp import FastMCP
 
 from .execution_policy_channel import read_execution_policy
 from .plugins import PluginInvoker, PluginManager
@@ -36,7 +38,8 @@ plugins must not like, comment, follow, repost, message, purchase, or log into a
 account. X publishing is allowed only through publish_x_post with the one-time
 approval token issued for the user's current or explicitly resumed task. Original downloaded media must be preserved."""
 
-mcp = FastMCP("social-agent-tools", instructions=SERVER_INSTRUCTIONS)
+mcp = DiagnosticFastMCP("social-agent-tools", instructions=SERVER_INSTRUCTIONS,
+    diagnostic_component="agent-mcp", accept_diagnostic_meta=False)
 
 
 class PluginToolRuntime:
@@ -134,25 +137,47 @@ async def call_plugin_tool(tool_name: str, arguments: dict[str, Any],
         raise ValueError(
             f"{tool_name} is a standard Tool; call mcp__social__{tool_name} directly"
         )
-    _check_step("call_plugin_tool", step_id, step_item_id)
-    output = await runtime().invoker.call(tool_name, arguments)
-    return output if isinstance(output, dict) else {"result": output}
+    return await _dispatch_plugin_call(tool_name, dict(arguments), step_id, step_item_id,
+                                       policy_tool="call_plugin_tool")
 
 
 async def _invoke_plugin_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     arguments = dict(arguments)
-    _check_step(tool_name, arguments.pop("step_id", None), arguments.pop("step_item_id", None))
-    output = await runtime().invoker.call(tool_name, arguments)
+    return await _dispatch_plugin_call(tool_name, arguments, arguments.pop("step_id", None),
+                                       arguments.pop("step_item_id", None), policy_tool=tool_name)
+
+
+async def _dispatch_plugin_call(tool_name: str, arguments: dict[str, Any], step_id: str | None,
+                                step_item_id: str | None, *, policy_tool: str) -> dict[str, Any]:
+    tool_runtime = runtime()
+    fields = {"tool": tool_name, "step_id": step_id, "step_item_id": step_item_id,
+              "tool_call_id": f"call-{uuid.uuid4().hex}"}
+    try:
+        binding = _check_step(policy_tool, step_id, step_item_id)
+        if binding is not None:
+            fields.update(step_id=tool_runtime.steps[binding[0]]["step_id"], step_item_id=binding[1])
+        fields.update(task_id=getattr(tool_runtime, "task_id", None),
+                      execution_id=getattr(tool_runtime, "active_execution_id", None))
+        fields["trace_id"] = current_context().get("trace_id") or fields["tool_call_id"]
+        with diagnostic_context(**fields):
+            output = await tool_runtime.invoker.call(tool_name, arguments)
+    except Exception as exc:
+        record_exception("agent-mcp", "plugin.invoke", exc,
+            state_root=getattr(tool_runtime, "state_root", None),
+            **{**fields, "task_id": getattr(tool_runtime, "task_id", None),
+               "execution_id": getattr(tool_runtime, "active_execution_id", None)})
+        raise
     return output if isinstance(output, dict) else {"result": output}
 
 
-def _check_step(tool: str, step_id: str | None, step_item_id: str | None) -> None:
+def _check_step(tool: str, step_id: str | None, step_item_id: str | None) -> tuple[int, str] | None:
     tool_runtime = runtime()
     tool_runtime.refresh_execution_policy()
     steps = getattr(tool_runtime, "steps", [])
     binding = resolve_step(steps, tool, step_id, step_item_id)
     if binding is None and any(step["tool"] == tool for step in steps):
         raise ValueError("Repeated or batched planned tools require step_id and step_item_id")
+    return binding
 
 
 @mcp.tool()
@@ -263,7 +288,7 @@ async def download_media(
         remaining_mb = tool_runtime.download_budget_remaining_bytes // (1024 * 1024)
         if remaining_mb < 1:
             raise ValueError("the confirmed execution download budget is exhausted")
-        output = await tool_runtime.invoker.call(
+        output = await _dispatch_plugin_call(
             "download_media",
             {
                 "urls": unique_urls,
@@ -273,6 +298,7 @@ async def download_media(
                 "telegram_scope": telegram_scope,
                 "telegram_max_messages": telegram_max_messages,
             },
+            step_id, step_item_id, policy_tool="download_media",
         )
         if not isinstance(output, dict):
             raise ValueError("download plugin returned a non-object result")
@@ -368,16 +394,27 @@ async def publish_x_post(
         if not tool_runtime.task_id or not tool_runtime.active_execution_id:
             raise ValueError("X publication requires a durable task execution")
         task_id, execution_id = tool_runtime.task_id, tool_runtime.active_execution_id
+        tool_runtime.task_store.validate_publish_inputs(task_id, execution_id, has_media=bool(media_paths))
+        validated_media = []
+        if len(media_paths or []) > 4:
+            raise ValueError("X 发布最多携带 4 个媒体文件。")
+        for value in media_paths or []:
+            path = Path(value).expanduser().resolve()
+            if (not path.is_relative_to(tool_runtime.output_root.resolve()) or not path.is_file()
+                    or path.stat().st_size == 0):
+                raise ValueError("发布媒体不存在、为空或不在 Agent 输出目录内，未执行发布。")
+            validated_media.append(str(path))
         tool_runtime.task_store.reserve_publish(task_id, execution_id)
         tool_runtime.publish_approval_consumed = True
-        output = await tool_runtime.invoker.call(
+        output = await _dispatch_plugin_call(
             "publish_x_post",
             {
                 "session_ref": session_ref,
                 "text": text,
                 "approval_token": approval_token,
-                "media_paths": media_paths or [],
+                "media_paths": validated_media,
             },
+            step_id, step_item_id, policy_tool="publish_x_post",
         )
         output = output if isinstance(output, dict) else {"result": output}
         tool_runtime.task_store.publish_result(task_id, execution_id, output.get("state", "unknown"))
@@ -489,6 +526,7 @@ def _compact_analysis_output(output: dict[str, Any], output_root: Path) -> dict[
 
 
 def main() -> None:
+    install_exception_hooks("agent-mcp")
     mcp.run(transport="stdio")
 
 

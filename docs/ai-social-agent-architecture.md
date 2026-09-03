@@ -1,8 +1,51 @@
 # 多平台 AI 社媒运营 Agent 技术架构
 
 > 版本：v1.0
-> 日期：2026-08-29
+> 日期：2026-08-29（浏览器生命周期补充：2026-09-03）
 > 适用平台：X、Facebook、Telegram 及后续扩展平台
+
+### 本地浏览器资源生命周期（已实现）
+
+核心 `harness_backend.execute` 在工具核验的整轮任务成功后调用 `browser_cleanup`。
+社媒插件通过可选 `runtime.task_cleanup_module` 提供受信任的清理 CLI，不加入模型工具目录。
+插件从核心本地执行策略取得 execution ID，在 `state_root/browser-resources/<execution_id>`
+以私有文件记录 Profile、浏览器实例 ID、初始标签页 ID 和在明确创建位置登记的标签页 ID，
+不记录 Cookie、页面文本或带签名的 URL。已有窗口被复用时不改变首次记录的所有权。
+工具之间保留任务新建标签页以供后续步骤复用；整轮成功后只关闭登记过的任务标签页。
+只有确认原先未运行且本任务启动的同一浏览器实例，才调用 `/browser/close` 关闭窗口。
+保留用户原有资源、后来手工新建的标签页；实例变化、未登记标签页或 Profile 锁冲突时不关窗口。
+失败、部分完成、取消、需要人工处理时不清理，便于检查和继续；不自动清扫历史失败任务。
+清理失败记录结构化日志并提示，不改变业务任务完成结果，不重发社媒内容。
+
+### 多对话与浏览器窗口调度（已实现）
+
+`ConversationWorkspace` 只管理标签页，通过不可变 `ConversationViewState` 和公开方法读取状态、
+协调共享控件，不访问页面私有线程或运行实例。`ConversationPane` 是 QWidget，不嵌套 QMainWindow；
+只负责输入和展示。每个 `ConversationController` 独立持有 Coordinator、RuntimeRouter、工作线程和
+任务状态；`conversation_workers` 不依赖页面。结果先更新控制器与存储，再发信号给所属视图，
+不按当前活动标签页转发。草稿、附件、上下文、进度和取消互相隔离；收到结果但线程未退出时仍然 busy。
+
+`ConversationRepository` 保存 `conversations/<conversation_id>.json`；`WorkspaceStore` 仅在
+打开标签页、顺序或选择发生变化时保存 `workspace.json`，进度更新不重复写磁盘。
+历史 `active.json` 只导入一次并保留原文件，使用 `legacy-migration.json` 标记；不覆盖已有独立记录，
+不再持续双写旧缓存。后台对话保存不改变选中标签。关闭标签页不删除历史；同数据目录用 QLockFile
+限制为一个桌面工作区，避免另一实例把活跃对话标记为中断。
+
+Harness 的规划可并行。执行前 `browser_scheduler` 从注册表解析全部授权窗口，
+以规范化本机 API 端口和 Profile ID 为键获取跨进程工作流锁（与插件的操作锁分离）。
+多个 session_ref、不同平台引用同一 Profile 时仍互斥。`browser_queue` 使用跨进程 FIFO 票据，
+有交集的窗口集合按入队顺序执行；不相交的任务可并行。每个票据持有独立 OS 存活锁，进程退出
+后可安全回收失效票据，不靠超时驱逐慢任务。队列事务锁只短暂更新元数据，不持锁等待业务。
+资源集合按固定顺序尝试全部获取，
+任一忙则释放本轮已取得的部分锁再等待，不持有部分资源等待其他窗口。等待事件不计已完成步骤，
+显示窗口与排在前面的对话；取消等待移除票据，不启动 Harness 执行或调用浏览器。
+`ExecutionLifecycle` 是工作流锁和单轮权限的唯一生命周期拥有者：取得窗口、复核注册表、授权，
+运行结束后撤权并回收隔离/取消运行实例，成功时清理本任务浏览器资源，最后释放窗口与票据。
+撤权、运行实例关闭失败也记录日志；退出路径仍释放锁，且不覆盖原始执行异常。
+可复用的只读 Harness 进程保留，但当轮权限撤销。独立窗口的任务可以同时执行。
+当前策略保证整轮窗口状态一致，分析等中间本地步骤期间仍保留该任务的窗口占用；不做跨任务
+页面状态切换或强行抢占。不是模型之间互发指令，也不把其他对话上下文发给模型。
+相同插件版本、不同环境的工作进程可共存，不为新对话关闭另一对话使用的进程。
 
 ## 1. 文档目标
 
@@ -405,13 +448,14 @@ LangChain 类型不得进入核心领域模型、数据库结构或执行协议�
 - 当前选中的端点、模型和进程内凭据会注入 Planning Cordis、Execution Cordis 及其 MCP 插件进程，避免规划、附件分析和文案生成意外使用不同模型。
 - 非敏感设置写入用户级 `llm-settings.json`；远端 API Key 仅存入 macOS Keychain 或 Windows Credential Manager。OpenAI API 使用独立 Platform API Key，不复用 ChatGPT 消费者订阅或登录会话。
 - Harness 的 JSONL session、checkpoint、token meter 和 compaction 存放在本地输出目录的隔离状态区。
-- `ConversationCoordinator` 只拥有桌面聊天展示缓存 `.social-agent-state/conversations/active.json`。权威任务存储为核心 `TaskStore`（`.social-agent-state/tasks.sqlite3`），按 conversation ID / task ID 保存未截断的原始请求、`resume_turn_id`、计划、execution ID、步骤检查点和发布状态。旧 active.json 幂等迁移，不删除原文件；后续超过 200 轮的完整任务记录仍在数据库中。模型上下文是另行生成的、最多 20,000 字符的展示摘要，不得用它校验发布授权。App 重启后恢复相同 conversation ID，以核心终态覆盖未收到 GUI 完成回调的缓存；未完成轮次恢复为中断状态。同次运行复用 Harness session，重启使用新 runtime epoch 与摘要回放，避免恢复旧 Harness session 的空事件问题。
+- `ConversationCoordinator` 管理桌面聊天状态，由 `ConversationRepository` 保存 `.social-agent-state/conversations/<conversation_id>.json`；`WorkspaceStore` 独立保存标签选择。权威任务存储为核心 `TaskStore`（`.social-agent-state/tasks.sqlite3`），按 conversation ID / task ID 保存未截断的原始请求、`resume_turn_id`、计划、execution ID、步骤检查点和发布状态。旧 active.json 只迁移一次，不删除原文件，也不再重复写入；后续超过 200 轮的完整任务记录仍在数据库中。模型上下文是另行生成的、最多 20,000 字符的展示摘要，不得用它校验发布授权。App 重启后恢复相同 conversation ID，以核心终态覆盖未收到 GUI 完成回调的缓存；未完成轮次恢复为中断状态。同次运行复用 Harness session，重启使用新 runtime epoch 与摘要回放，避免恢复旧 Harness session 的空事件问题。
 - Harness 决定自然语言指向的历史任务；核心 `task_intent.py` 只校验本会话的完整原始请求和任务链。发布防重检查覆盖该任务及其后续重试（包括兄弟分支），不扫描时间上更晚的无关任务。执行前再次校验，不从模型总结、附件或网页推导授权。
 - Planning 输出的 `steps` 必须是可观察、可独立完成的执行阶段，不能把打开搜索页、输入关键词和点选结果拆成多个 UI 微动作。Execution Backend 在每次 Tool 调用开始和结束时发出步骤事件，`completed` 表示已经完成的计划步骤数；GUI 使用 `completed / total` 计算总进度并把当前步骤实时追加到 Agent 输出区。若 5 步任务已完成 2 步且正在执行第 3 步，进度保持 40%，第三步完成后才变为 60%。
 - 步骤标识由核心生成 `step-1…`，主要工具由 `step_tools` 声明，可选 `step_units` 声明该步必须成功的批次/执行单元数（默认 1）。执行提示提供规范化 `execution_steps`；核心 MCP 接收 `step_id` 和 `step_item_id=item-1…`，校验后剥离这两个字段再调用插件，因此不改变插件协议。`ExecutionTracker` 用实际 Tool call ID 关联结果，并按步骤/单元去重，失败重试沿用原单元，全部单元成功才完成该步骤。缺少标识的旧调用只在全计划唯一匹配时兼容；重复工具步骤不得猜测归属。结果归一化与成功判断在独立 `tool_results.py` 中，部分批次或未确认发布不能增加完成数。
 - 执行生命周期和每次进度检查点由核心 Backend 写入 TaskStore；GUI 只显示事件与镜像结果。MCP 在调用发布插件前以 SQLite 事务提交不可回退的 `publish_attempted` 标记，磁盘故障则拒绝发送；提交后丢失响应保持 unknown，明确收到 `state=published` 才确认成功。数据库事务也阻止两个重试分支同时发布。GUI/CLI/服务入口共用该机制，不依赖界面是否仍在运行。任务记录不保存 Tool 参数和一次性令牌，已有会话/代理凭据仍由原存储管理。
 - Harness 若在 Tool 全部成功且最终 assistant 文本已经落盘后才发生上下文溢出或压缩错误，客户端会从该 execution session 的 JSONL 恢复最终文本、向结果附加运行错误并重置执行 session；不会把已经完成的下载、分析或文案任务误报为空响应，也不会自动重复执行有副作用的 Tool。
 - 每轮执行前，`ExecutionPolicyChannel` 以新的 execution ID 原子写入短生命周期本地授权；常驻 MCP 在每次下载调用前重新读取，并按 execution ID 重置帖子数、URL 去重集合和容量预算。授权在该轮结束后撤销，因此无需牺牲 Execution 上下文来隔离数量限制。X 发布仍使用带一次性令牌的独立 Execution/MCP 进程。
+- Harness 的 `dsh-mcp-client` 会过滤隐式环境中的 `KEY/PASSWORD/SECRET/TOKEN`。执行 YAML 必须显式映射 `SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN` 和 `SOCIAL_AGENT_EXECUTION_POLICY_PATH`；Backend 对无发布授权的进程显式传空令牌，保留上游凭据隔离。原生 `tool/call.arguments` 是 JSON 字符串，事件适配器先解析再读取步骤标识，兼容已解析字典，非法参数不计步。发布是否越过插件转交边界以 TaskStore 的原子记录为准；GUI 缓存不能覆盖该事实。旧版本错误组合（有 core run ID、attempted=true，但持久发布状态仍为 not_attempted）启动时被修正；unknown/failed/published 与没有 core run 的旧记录继续保守防重。集成测试通过真实上游 MCP 子进程验证令牌传递，不调用任何社媒 Tool。
 - 采用 npm 包集成而不是把完整 Harness 源码复制进 `social_agent`；`package.json` 和 `package-lock.json` 锁定依赖，安装使用 `npm ci`。
 
 Harness 是可替换的 `AgentRuntimeAdapter`，其 JSON-RPC event、MCP 名称和内部 session 不能成为跨服务领域协议。升级 Release Candidate 前必须运行契约测试、Tool 白名单测试、无工具规划测试和真实模型冒烟测试。
@@ -594,7 +638,7 @@ tools/
 
 `social.publish_x_post` 是当前唯一允许的外部写 Tool，并且不复用通用 `browser.operate` 的点击能力。只有用户文字明确表达发布到 X、所选 `session_ref` 属于 X、规划契约写入 `write_actions=["publish_x"]`，GUI 点击发送后不再弹出二次确认框，Execution Backend 按该执行范围启动新的隔离 MCP 进程并签发随机一次性令牌。令牌同时由核心 MCP 与插件验证，在打开/操作浏览器前消费，执行结束立即销毁。一次计划最多发布一条；HTTP/GraphQL 失败或结果不明均不自动重试。媒体必须位于 Agent 输出根目录内且最多 4 个，审计日志排除令牌。通用页面 Tool 继续拦截发布按钮与文件输入，因此无法绕过专用发布契约。
 
-续执行时，Planning Harness 输出 `resume_turn_id` 和 `write_actions`；核心只从当前会话中被引用的原始用户消息校验发布权限，不能从模型总结或媒体文本授予权限。本轮“不发布”覆盖历史范围，普通新任务不自动继承写权限。上下文同时携带发布尝试标记和结果；GUI 收到发布调用事件即持久化标记，已尝试、结果不明或中断的任务不能仅凭“重试”重复提交。规划修复轮保留相同上下文与具体校验错误。
+续执行时，Planning Harness 输出 `resume_turn_id` 和 `write_actions`；核心只从当前会话中被引用的原始用户消息校验发布权限，不能从模型总结或媒体文本授予权限。“只重试失败的 X 发布步骤”属于任务引用，前置校验允许它进入 Harness，但不会把提及“X 发布”当作一次新的发布授权。本轮“不发布”覆盖历史范围，普通新任务不自动继承写权限。上下文同时携带发布尝试标记和结果；标记由核心 MCP 在转交发布插件前持久化，GUI 只镜像核心状态，授权预检失败不算已提交。已尝试、结果不明或缺乏核心记录的旧中断任务不能仅凭“重试”重复提交。规划修复轮保留相同上下文与具体校验错误。
 
 执行步骤由 Planning Harness 以 `steps` 与 `step_tools` 一一映射，核心通过 Harness 原生 `tool/call` 的 callId 与 `tool/result` 中 toolCallId 关联实际结果。错误、空结果、辅助工具和重复生成不会推进其他步骤；X 发布只有工具返回 `state=published` 才完成。最终结果保存 `completion_status`、`completed_steps`、`total_steps`、`publish_state`，会话按实际结果记录 `succeeded/partial/failed`，不把 LLM 正常结束等同于任务完成。旧计划缺少工具映射时保守标记未核验，不伪造 100% 进度。
 
@@ -657,6 +701,27 @@ class ToolSpec(BaseModel):
 - Tool 版本、输入、输出、调用人、模型和 Trace ID 必须进入审计日志。
 
 ### 7.5 桌面 Tool 插件安装模型
+
+发布准备校验独立于发布授权：核心在预留一次性发布前，通过任务日志检查发布前已计划 Tool 步骤是否完成；
+下载/分析失败不能被模型摘要替代。Harness 规划的 `publish_media_required` 标识发布是否必须携媒体，
+旧计划和续任务保守继承下载/附件要求，空媒体列表不会静默降级。插件限定同一前景 composer 的编辑器、
+文件输入和按钮，等待媒体预览；CreateTweet 请求提交前再次核对文本、媒体 ID 数量并阻止重复请求。
+点击前 actionability trial 超时为未点击失败；真实点击后无确认仍为 unknown，不重试；只有解析到帖子 ID 才报告 published。
+
+开发期诊断日志与业务审计分离：Agent 将 `<state_root>/logs` 通过 `SOCIAL_AGENT_LOG_DIR`
+传递到每个独立 Tool 进程。每条 JSONL 包含时间、组件、阶段、可用的任务/会话/执行/Trace ID、
+异常类型、脱敏消息、堆栈位置和 cause/context 异常链。Tool 在边界包装异常后仍保留原始 cause；
+OCR/ASR/语义模型的异常降级也记录。Pydantic 只保留字段路径/类型，不记录输入值；不主动序列化
+请求、模型完整响应、局部变量或源码行，凭据和 URL 查询参数脱敏。X 发布结果不明或拒绝时记录
+超时/HTTP/GraphQL 错误码，日志功能本身不重试、不发布。
+采用每组件每进程 5 MiB ×（当前文件 + 3 备份）轮转，限制非活跃进程历史组；日志失败不覆盖
+业务错误，MCP stdout 保持纯协议。Core 提供规范源文件 `diagnostics.py` 与 MCP 适配器
+`diagnostic_mcp.py`，统一插件构建脚本自动同步，独立 Tool 使用随包副本，不反向依赖 Agent。
+每次调用通过 MCP `_meta["com.socialagent/diagnostics"]` 传递 task/execution/step/item/call/trace ID；
+Host 队列逐请求快照，后台常驻任务不继承第一条请求上下文。元数据只用于诊断，不进入 Tool 参数、
+权限判断或环境配置。异常源产生 `error_id`，只写一次完整异常，跨进程通过响应 `_meta` 关联，
+上层仅记传播位置和同一错误 ID；缺少元数据的旧插件仍兼容。回归覆盖真实 MCP 子进程连续/并发请求、
+线程内降级、参数校验、重复错误关联和凭据脱敏。具体目录与保留规则见 README 的“开发期异常日志”。
 
 macOS/Windows 桌面端采用“轻量 Agent Core + 用户级 Tool 插件”部署，不再把所有 Tool 依赖复制进 `SocialAgent.app`：
 

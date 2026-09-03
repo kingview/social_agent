@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -182,3 +183,124 @@ def test_mcp_records_publish_before_plugin_call_without_gui(tmp_path, monkeypatc
         assert not report["publish_attempted"]
     else:
         assert report["publish_state"] == ("published" if outcome == "published" else "unknown")
+
+
+@pytest.mark.parametrize("state", ["not_attempted", "unknown", "failed", "published"])
+def test_repairs_only_impossible_gui_attempt_marker_in_core_runs(tmp_path, state):
+    store = TaskStore(tmp_path)
+    task = store.ensure_task("conversation", "发到X")
+    store.start(task, "run")
+    # Reproduce the old GUI importing a rejected publish call as an attempt.
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE tasks SET publish_attempted=1,publish_state=? WHERE task_id=?", (state, task))
+    restored = TaskStore(tmp_path)
+    restored.import_turn("conversation", {"turn_id": task, "user_message": "发到X", "publish_attempted": True,
+        "result": {"tool_calls": ["mcp__social__publish_x_post"], "publish_state": "unknown"}})
+    assert restored.history("conversation")[0].publish_attempted == (state != "not_attempted")
+    assert restored.execution(task)["publish_state"] == state
+
+
+def test_pre_journal_legacy_publication_marker_remains_conservative(tmp_path):
+    store = TaskStore(tmp_path)
+    task = store.ensure_task("conversation", "发到X")
+    store.import_turn("conversation", {"turn_id": task, "user_message": "发到X",
+        "result": {"tool_calls": ["mcp__social__publish_x_post"]}})
+    assert TaskStore(tmp_path).history("conversation")[0].publish_attempted
+
+
+@pytest.mark.parametrize("failed_step", ["step-1", "step-2", "step-3", "step-4"])
+def test_publish_stops_when_planned_prerequisite_is_not_complete(tmp_path, monkeypatch, failed_step):
+    store=TaskStore(tmp_path)
+    task=store.ensure_task("conversation", "下载分析并发到X")
+    plan={"steps":["搜索","下载","分析","文案","发布"],
+          "step_tools":["browse_posts","download_media","analyze_content","generate_post_copy","publish_x_post"],
+          "publish_media_required":True}
+    store.set_plan(task,plan);store.start(task,"run")
+    steps=[{"step_id":f"step-{i+1}","tool":tool,"units":1,
+            "status":"pending" if f"step-{i+1}"==failed_step else "completed"}
+           for i,tool in enumerate(plan['step_tools'])]
+    store.checkpoint(task,"run",{"steps":steps,"summary":"模型声称已完成"})
+    async def forbidden(*args):
+        raise AssertionError("Incomplete task must not reach browser/plugin")
+    runtime=SimpleNamespace(task_store=store,task_id=task,active_execution_id="run",
+        refresh_execution_policy=lambda:None,require_authorized_session=lambda _:None,steps=steps,
+        publish_lock=asyncio.Lock(),publish_approval_token="test-token",publish_approval_consumed=False,
+        invoker=SimpleNamespace(call=forbidden))
+    monkeypatch.setattr(mcp_server,'_runtime',runtime)
+    with pytest.raises(ValueError,match='前置步骤尚未完成'):
+        asyncio.run(mcp_server.publish_x_post('sess_x_abcdefghijklmnopqrstuvwx','草稿','test-token',step_id='step-5'))
+    assert not store.execution(task)['publish_attempted']
+    assert not runtime.publish_approval_consumed
+
+
+@pytest.mark.parametrize("required", [None, True, False])
+def test_media_requirement_retained_and_explicit_text_only_supported(tmp_path,required):
+    store=TaskStore(tmp_path)
+    task=store.ensure_task('conversation','下载并发到X')
+    store.set_plan(task,{'step_tools':['download_media','publish_x_post'],'publish_media_required':required})
+    store.start(task,'run')
+    store.checkpoint(task,'run',{'steps':[{'step_id':'step-1','status':'completed'}]})
+    if required is not False:
+        with pytest.raises(ValueError,match='media_paths'):
+            store.validate_publish_inputs(task,'run',has_media=False)
+    else:
+        store.validate_publish_inputs(task,'run',has_media=False)
+    store.validate_publish_inputs(task,'run',has_media=True)
+    assert not store.execution(task)['publish_attempted']
+
+
+def test_resume_publish_keeps_original_media_requirement(tmp_path):
+    store=TaskStore(tmp_path)
+    original=store.ensure_task('conversation','下载图片并发到X')
+    store.set_plan(original,{'step_tools':['download_media','publish_x_post']})
+    resumed=store.ensure_task('conversation','继续发布')
+    store.set_plan(resumed,{'resume_turn_id':original,'step_tools':['publish_x_post']})
+    store.start(resumed,'run')
+    with pytest.raises(ValueError,match='media_paths'):
+        store.validate_publish_inputs(resumed,'run',has_media=False)
+    store.validate_publish_inputs(resumed,'run',has_media=True)
+
+
+def test_missing_media_file_does_not_consume_grant(tmp_path,monkeypatch):
+    store=TaskStore(tmp_path)
+    task=store.ensure_task('conversation','携图片发到X');store.start(task,'run')
+    runtime=SimpleNamespace(task_store=store,task_id=task,active_execution_id='run',
+        refresh_execution_policy=lambda:None,require_authorized_session=lambda _:None,
+        steps=[{'step_id':'step-1','tool':'publish_x_post','units':1}],output_root=tmp_path,
+        publish_lock=asyncio.Lock(),publish_approval_token='test-token',publish_approval_consumed=False)
+    monkeypatch.setattr(mcp_server,'_runtime',runtime)
+    with pytest.raises(ValueError,match='发布媒体不存在'):
+        asyncio.run(mcp_server.publish_x_post('sess_x_abcdefghijklmnopqrstuvwx','草稿','test-token',
+                    media_paths=[str(tmp_path/'missing.jpg')],step_id='step-1'))
+    assert not store.execution(task)['publish_attempted'] and not runtime.publish_approval_consumed
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_rejected_grant_does_not_reach_plugin_or_poison_retry_history(tmp_path, monkeypatch, missing):
+    store = TaskStore(tmp_path)
+    task = store.ensure_task("conversation", "发到X")
+    store.start(task, "run")
+    calls = []
+
+    class Invoker:
+        async def call(self, *args):
+            calls.append(args)
+            raise AssertionError("Rejected grant must never reach a plugin")
+
+    runtime = SimpleNamespace(task_store=store, task_id=task, active_execution_id="run",
+        refresh_execution_policy=lambda: None, require_authorized_session=lambda _: None,
+        steps=[{"step_id": "step-1", "tool": "publish_x_post", "units": 1}],
+        publish_lock=asyncio.Lock(), publish_approval_token="" if missing else "different-token",
+        publish_approval_consumed=False, invoker=Invoker())
+    monkeypatch.setattr(mcp_server, "_runtime", runtime)
+    with pytest.raises(ValueError, match="approval"):
+        asyncio.run(mcp_server.publish_x_post("sess_x_abcdefghijklmnopqrstuvwx", "测试草稿", "test-token",
+                                              step_id="step-1"))
+    store.checkpoint(task, "run", {"publish_state": "unknown"}, state="failed")
+    store.import_turn("conversation", {"turn_id": task, "user_message": "发到X",
+        "publish_attempted": True, "result": {"tool_calls": ["mcp__social__publish_x_post"], "publish_state": "unknown"}})
+    assert not calls
+    assert store.execution(task)["publish_state"] == "not_attempted"
+    assert not store.history("conversation")[0].publish_attempted
+    assert resolve_write_actions({"resume_turn_id": task, "write_actions": ["publish_x"]},
+                                 "重试", store.history("conversation"))[0] == ["publish_x"]

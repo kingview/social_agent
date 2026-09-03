@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from .diagnostics import (
+    TRANSPORT_KEY, current_context, diagnostic_context, link_remote_error,
+    log_async_exception, record_exception, register_secrets, transport_context,
+)
 
 
 class PluginHostError(RuntimeError):
@@ -47,6 +52,7 @@ class _Request:
     result: asyncio.Future[Any]
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
+    diagnostics: dict[str, str] = field(default_factory=dict)
 
 
 class _PluginWorker:
@@ -56,7 +62,8 @@ class _PluginWorker:
         self.endpoint = endpoint
         self.queue: asyncio.Queue[_Request | None] = asyncio.Queue()
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self.task = asyncio.create_task(self._run())
+        # A warm worker must never inherit the first caller's task context.
+        self.task = asyncio.create_task(self._run(), context=contextvars.Context())
 
     async def request(
         self,
@@ -73,6 +80,7 @@ class _PluginWorker:
                 result=result,
                 tool_name=tool_name,
                 arguments=arguments,
+                diagnostics=transport_context(current_context()),
             )
         )
         return await result
@@ -87,6 +95,8 @@ class _PluginWorker:
 
     async def _run(self) -> None:
         active_request: _Request | None = None
+        environment = self.endpoint.parameters.env or {}
+        register_secrets(*(value for key, value in environment.items() if any(word in key.upper() for word in ("KEY", "TOKEN", "PASSWORD", "SECRET", "COOKIE"))))
         try:
             async with stdio_client(self.endpoint.parameters) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -105,30 +115,30 @@ class _PluginWorker:
                         active_request = await self.queue.get()
                         if active_request is None:
                             return
-                        try:
-                            if active_request.operation == "list":
-                                response = await session.list_tools()
-                                value = [
-                                    tool.model_dump(mode="json") for tool in response.tools
-                                ]
+                        with diagnostic_context(replace=True, **active_request.diagnostics,
+                                                plugin_id=self.endpoint.plugin_id, tool=active_request.tool_name):
+                            try:
+                                if active_request.operation == "list":
+                                    response = await session.list_tools()
+                                    value = [tool.model_dump(mode="json") for tool in response.tools]
+                                else:
+                                    response = await session.call_tool(
+                                        active_request.tool_name or "", active_request.arguments or {},
+                                        meta={TRANSPORT_KEY: active_request.diagnostics},
+                                    )
+                                    value = _decode_tool_result(response, active_request.tool_name or "plugin Tool")
+                            except Exception as exc:
+                                record_exception("agent-plugin-host", "plugin.call", exc)
+                                if not active_request.result.done():
+                                    active_request.result.set_exception(exc)
                             else:
-                                response = await session.call_tool(
-                                    active_request.tool_name or "",
-                                    active_request.arguments or {},
-                                )
-                                value = _decode_tool_result(
-                                    response,
-                                    active_request.tool_name or "plugin Tool",
-                                )
-                        except Exception as exc:
-                            if not active_request.result.done():
-                                active_request.result.set_exception(exc)
-                        else:
-                            if not active_request.result.done():
-                                active_request.result.set_result(value)
-                        finally:
-                            active_request = None
+                                if not active_request.result.done():
+                                    active_request.result.set_result(value)
+                            finally:
+                                active_request = None
         except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                record_exception("agent-plugin-host", "plugin.transport", exc, plugin_id=self.endpoint.plugin_id)
             error = PluginHostError(_exception_message(exc))
             if not self.ready.done():
                 self.ready.set_exception(error)
@@ -215,7 +225,7 @@ class PluginHost:
         stale = [
             key
             for key in self._workers
-            if key[0] == endpoint.plugin_id and key != endpoint.key
+            if key[0] == endpoint.plugin_id and key[1] != endpoint.version
         ]
         for key in stale:
             worker = self._workers.pop(key)
@@ -233,6 +243,7 @@ class PluginHost:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.set_exception_handler(log_async_exception)
         self._loop.run_forever()
         self._loop.close()
 
@@ -242,7 +253,10 @@ def _decode_tool_result(result: Any, tool_name: str) -> Any:
         message = "\n".join(
             str(getattr(item, "text", "")) for item in result.content
         ).strip()
-        raise PluginHostError(message or f"plugin Tool failed: {tool_name}")
+        error = PluginHostError(message or f"plugin Tool failed: {tool_name}")
+        meta = getattr(result, "meta", None)
+        link_remote_error(error, meta.get(TRANSPORT_KEY) if isinstance(meta, dict) else None)
+        raise error
     if result.structuredContent is not None:
         return result.structuredContent
     for item in result.content:

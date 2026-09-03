@@ -36,6 +36,13 @@ class TaskStore:
                 execution_json TEXT, publish_attempted INTEGER NOT NULL DEFAULT 0,
                 publish_state TEXT NOT NULL DEFAULT 'not_attempted')""")
             db.execute("CREATE INDEX IF NOT EXISTS task_conversation ON tasks(conversation_id)")
+            # Earlier GUI imports inferred 'attempted' merely from a tool call,
+            # including requests rejected BEFORE reserve_publish. A real core
+            # reservation atomically changes BOTH fields (state becomes unknown).
+            # Repair only this impossible combination; never clear unknown,
+            # failed, published, or pre-journal legacy attempts.
+            db.execute("""UPDATE tasks SET publish_attempted=0
+                WHERE run_id IS NOT NULL AND publish_attempted=1 AND publish_state='not_attempted'""")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -76,7 +83,8 @@ class TaskStore:
         with self._db() as db:
             db.execute("""UPDATE tasks SET legacy_json=?,
                 resume_task_id=CASE WHEN plan_json IS NULL THEN ? ELSE resume_task_id END,
-                publish_attempted=MAX(publish_attempted,?) WHERE task_id=?""",
+                publish_attempted=CASE WHEN run_id IS NULL THEN MAX(publish_attempted,?)
+                                      ELSE publish_attempted END WHERE task_id=?""",
                 (json.dumps(turn, ensure_ascii=False), plan.get("resume_turn_id"), attempted, task_id))
 
     def history(self, conversation_id: str, *, exclude: str | None = None) -> tuple[TaskRecord, ...]:
@@ -84,7 +92,8 @@ class TaskStore:
             rows = db.execute("SELECT * FROM tasks WHERE conversation_id=?", (conversation_id,)).fetchall()
         return tuple(TaskRecord(
             row["task_id"], row["message"], row["resume_task_id"],
-            bool(row["publish_attempted"]) or json.loads(row["execution_json"] or "{}").get("publish_state") in {"published", "failed", "unknown"},
+            bool(row["publish_attempted"]) or (not row["run_id"] and
+                json.loads(row["execution_json"] or "{}").get("publish_state") in {"published", "failed", "unknown"}),
             not row["run_id"] and json.loads(row["legacy_json"] or "{}").get("error_stage") == "interrupted",
         ) for row in rows if row["task_id"] != exclude)
 
@@ -112,7 +121,7 @@ class TaskStore:
                 "error": str(result.get("error") or legacy.get("error") or "")[:2000],
                 "resume_turn_id": record["resume_task_id"],
                 "publish_attempted": bool(record["publish_attempted"]),
-                "publish_state": record["publish_state"] if record["publish_attempted"] else result.get("publish_state"),
+                "publish_state": record["publish_state"] if record["run_id"] else result.get("publish_state"),
             }
             candidate = [row, *rows]
             if rows and len(json.dumps({"recent_turns": candidate}, ensure_ascii=False)) > 20000:
@@ -161,10 +170,53 @@ class TaskStore:
             if row is None:
                 raise ValueError("Unknown task execution")
             report = dict(report)
-            if row["publish_attempted"] and report.get("publish_state") in {"not_attempted", "not_requested"}:
+            if row["publish_attempted"] or report.get("publish_state") != "not_requested":
                 report["publish_state"] = row["publish_state"]
             db.execute("UPDATE tasks SET execution_json=?,state=? WHERE task_id=? AND run_id=?",
                        (json.dumps(report, ensure_ascii=False), state, task_id, run_id))
+
+    def validate_publish_inputs(self, task_id: str, run_id: str, *, has_media: bool) -> None:
+        """Validate planned prerequisites against durable tool results, not model claims.
+
+        Rejected preparation must not consume the one-shot publication grant.
+        The planner decides text-only vs media; old plans conservatively retain
+        their download/repair/attachment requirement, including resumed tasks.
+        """
+        with self._db() as db:
+            row = db.execute("SELECT * FROM tasks WHERE task_id=? AND run_id=?", (task_id, run_id)).fetchone()
+            if row is None:
+                raise ValueError("Unknown publication task execution")
+            plan = json.loads(row["plan_json"] or "{}")
+            tools = plan.get("step_tools") or []
+            if "publish_x_post" in tools:
+                report = json.loads(row["execution_json"] or "{}")
+                statuses = {s["step_id"]: s for s in report.get("steps", [])}
+                incomplete = []
+                for index, tool in enumerate(tools[:tools.index("publish_x_post")]):
+                    if tool != "local_reasoning" and statuses.get(f"step-{index+1}", {}).get("status") != "completed":
+                        incomplete.append(str(index + 1))
+                if incomplete:
+                    raise ValueError("发布前置步骤尚未完成（第 " + "、".join(incomplete) + " 步）；请先完成下载/分析等步骤，未执行发布。")
+            required = plan.get("publish_media_required")
+            source = row
+            visited = set()
+            while required is None:
+                if any(t in {"download_media", "process_watermark"} for t in tools) or plan.get("attachments"):
+                    required = True
+                    break
+                parent = source["resume_task_id"]
+                if not parent or parent in visited:
+                    break
+                visited.add(parent)
+                source = db.execute("SELECT * FROM tasks WHERE task_id=? AND conversation_id=?",
+                                    (parent, row["conversation_id"])).fetchone()
+                if source is None:
+                    break
+                plan = json.loads(source["plan_json"] or "{}")
+                tools = plan.get("step_tools") or []
+                required = plan.get("publish_media_required")
+            if required and not has_media:
+                raise ValueError("该任务要求携带媒体发布，但 media_paths 为空；未执行发布，也不会自动改为纯文字。")
 
     def reserve_publish(self, task_id: str, run_id: str) -> None:
         """Must commit BEFORE forwarding an external write, even with no GUI."""
@@ -206,7 +258,7 @@ class TaskStore:
         if row is None or not row["run_id"]:
             return None
         report = json.loads(row["execution_json"] or "{}")
-        if row["publish_attempted"]:
+        if row["publish_attempted"] or report.get("publish_state") != "not_requested":
             report["publish_state"] = row["publish_state"]
         return {**report, "task_id": task_id, "run_id": row["run_id"], "state": row["state"],
                 "publish_attempted": bool(row["publish_attempted"])}

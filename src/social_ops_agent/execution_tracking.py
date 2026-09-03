@@ -1,6 +1,7 @@
 """Match observable tool results to planned steps, never calls to percentages."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .contracts import AgentProgress, DynamicAgentPlan
@@ -28,8 +29,18 @@ class ExecutionTracker:
         if call_id in self.calls or call_id in self.handled_results:
             return self.progress("等待当前工具返回结果。")
         self.tool_calls.append(name)
-        arguments = data.get("arguments") or {}
+        arguments = data.get("arguments", {})
         try:
+            # Native Harness events carry serialized JSON; test/programmatic
+            # clients may already supply a dictionary. Do not infer a step from
+            # malformed JSON, an array, or a scalar.
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("Tool arguments must be an object")
+            if any(arguments.get(key) is not None and not isinstance(arguments[key], str)
+                   for key in ("step_id", "step_item_id")):
+                raise ValueError("Step references must be strings")
             binding = resolve_step(self.steps, short, arguments.get("step_id"), arguments.get("step_item_id"))
         except (ValueError, AttributeError):
             binding = None
@@ -89,6 +100,13 @@ class ExecutionTracker:
             else f"任务未全部完成：已完成 {len(self.completed)}/{len(self.tools)} 步。"
         )
         return self.progress(message, stage="done" if complete else "incomplete")
+
+    def reconcile_publication(self, state: str) -> None:
+        """Core MCP's durable submission boundary outranks a tool-call event."""
+        self.publish_state = state
+        if state != "published":
+            self.completed.difference_update(i for i, tool in enumerate(self.tools) if tool == "publish_x_post")
+            self.completed_items = {(i, item) for i, item in self.completed_items if self.tools[i] != "publish_x_post"}
 
     def progress(self, message: str, *, stage: str = "step") -> AgentProgress:
         return AgentProgress(stage=stage, completed=len(self.completed), total=len(self.tools), message=message)

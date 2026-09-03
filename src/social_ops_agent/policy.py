@@ -16,6 +16,14 @@ _X_PUBLISH_INTENT = re.compile(
     re.IGNORECASE,
 )
 
+# A reference such as "重试失败的 X 发布步骤" is not a fresh publication
+# authorization. Let Harness resolve it against the task history instead of
+# reporting it as an unsupported-platform request before planning even starts.
+_X_PUBLISH_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:X|Twitter|推特)(?![A-Za-z0-9_])\s*(?:上|的|上的)?\s*(?:发布|发帖)",
+    re.IGNORECASE,
+)
+
 
 def publishing_declined(message: str) -> bool:
     return bool(re.search(r"(?:不要|别|不必|暂不|无需|勿|do not|don't)\s*(?:再|自动|公开)?\s*(?:发布|发帖|发|post|publish)", message, re.IGNORECASE))
@@ -42,7 +50,8 @@ class ExecutionPolicy:
             )
         write_actions = requested_write_actions(message)
         generic_publish = any(word in message for word in ("发布", "发帖", "发送到"))
-        if generic_publish and not write_actions and not publishing_declined(message):
+        if (generic_publish and not write_actions and not publishing_declined(message)
+                and not _X_PUBLISH_REFERENCE.search(message)):
             raise ExecutionPolicyError("当前只支持用户明确要求的自动发布到 X，不支持其他平台写操作。")
 
     def validate_plan(self, plan: Any) -> None:

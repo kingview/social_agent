@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import record_exception
+
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -32,6 +34,7 @@ class InstallPluginWorker(QThread):
         try:
             record = self.manager.install(self.archive)
         except Exception as exc:
+            record_exception("agent", "plugin_desktop.handled", exc)
             self.failed.emit(str(exc) or type(exc).__name__)
         else:
             self.succeeded.emit(record)

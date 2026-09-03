@@ -14,6 +14,8 @@ from urllib.request import Request, urlopen
 import keyring
 from keyring.errors import KeyringError
 
+from .diagnostics import register_secrets
+
 
 SETTINGS_VERSION = 1
 KEYRING_SERVICE = "com.socialagent.llm"
@@ -83,6 +85,9 @@ class LLMSettings:
     base_url: str
     model: str
     api_key: str
+
+    def __post_init__(self) -> None:
+        register_secrets(self.api_key)
 
     @property
     def provider_id(self) -> str:

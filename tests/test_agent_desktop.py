@@ -102,7 +102,7 @@ def test_desktop_has_single_send_control(tmp_path: Path) -> None:
     window.session_combo.hidePopup()
 
     executions = []
-    window.execute_plan = lambda: executions.append(window._pending_plan)  # type: ignore[method-assign]
+    window.execute_plan = lambda: executions.append(window.controller.pending_plan)  # type: ignore[method-assign]
     plan = AgentPlan(
         objective="搜索帖子",
         platform="douyin",
@@ -110,7 +110,7 @@ def test_desktop_has_single_send_control(tmp_path: Path) -> None:
         source="search",
         query="web3",
     )
-    window._plan_succeeded(plan)
+    window.controller.accept_plan(plan)
     assert executions == [plan]
     window.close()
     app.processEvents()
@@ -152,25 +152,26 @@ def test_plan_starts_without_extra_publish_confirmation(
         write_actions=["publish_x"] if publish else [],
         requires_confirmation=legacy_confirmation,
     )
-    turn_id = window._conversation.begin_turn(plan.objective)
-    window._active_turn_id = turn_id
+    turn_id = window.controller.conversation.begin_turn(plan.objective)
+    window.controller.active_turn_id = turn_id
     try:
-        window._plan_succeeded(plan)
-        assert window._pending_plan is None
-        turn = window._conversation.turns[-1]
-        persisted = json.loads(window._conversation.path.read_text())["turns"][-1]
+        window.controller.accept_plan(plan)
+        assert window.controller.pending_plan is None
+        turn = window.controller.conversation.turns[-1]
+        persisted = json.loads(window.controller.conversation.path.read_text())["turns"][-1]
         assert len(started) == 1
         assert started[0]._plan == plan
-        assert window._execution_worker is started[0]
+        assert window.controller.execution_worker is started[0]
         assert turn.status == persisted["status"] == "executing"
-        assert window._active_turn_id == turn_id
+        assert window.controller.active_turn_id == turn_id
         assert "已取消本次 X 发布" not in window.chat.toPlainText()
         assert "开始执行" in window.chat.toPlainText()
         # Duplicate callbacks must not start a second execution.
         window.execute_plan()
         assert len(started) == 1
     finally:
-        window._execution_finished()
+        window.controller.finish_execution()
+        window.controller.active_turn_id = None  # Isolated fixture never ran the worker.
         window.close()
         app.processEvents()
 
@@ -285,7 +286,7 @@ def test_desktop_restores_active_conversation_and_last_session(tmp_path: Path) -
         ),
     )
 
-    assert window._conversation_id == conversation_id
+    assert window.controller.conversation_id == conversation_id
     assert window.session_combo.currentData() == AUTO_SESSION_REF
     assert "第一条已经下载" in window.chat.toPlainText()
     window.close()
@@ -305,7 +306,7 @@ def test_execution_progress_is_rendered_in_agent_chat_by_completed_steps(
         ),
     )
 
-    window._execution_progress(
+    window.controller.report_execution(
         AgentProgress(
             stage="step",
             completed=2,
@@ -329,18 +330,18 @@ def test_gui_persists_partial_completion_and_publish_attempt(tmp_path) -> None:
         plugin_root=tmp_path / "plugins",
         llm_settings_store=LLMSettingsStore(tmp_path / "llm.json", credentials=MemoryCredentials()),
     )
-    turn_id = window._conversation.begin_turn("继续并发布到X")
-    window._active_turn_id = turn_id
-    window._execution_progress(AgentProgress(stage="publishing", completed=4, total=5, message="发布中"))
+    turn_id = window.controller.conversation.begin_turn("继续并发布到X")
+    window.controller.active_turn_id = turn_id
+    window.controller.report_execution(AgentProgress(stage="publishing", completed=4, total=5, message="发布中"))
     # Display-only progress cannot create an authoritative publication marker.
-    assert json.loads(window._conversation.path.read_text())["turns"][-1]["publish_attempted"] is False
-    window._execution_succeeded(AgentExecutionResult(
+    assert json.loads(window.controller.conversation.path.read_text())["turns"][-1]["publish_attempted"] is False
+    window.controller.accept_result(AgentExecutionResult(
         runtime="deepseek_harness",
         plan=DynamicAgentPlan(objective="发布", summary="发布", steps=["发布"]),
         summary="任务未全部完成：X 发布结果不明", completion_status="partial",
         completed_steps=4, total_steps=5, publish_state="unknown",
     ))
-    persisted = json.loads(window._conversation.path.read_text())["turns"][-1]
+    persisted = json.loads(window.controller.conversation.path.read_text())["turns"][-1]
     assert persisted["status"] == "partial"
     assert persisted["result"]["publish_state"] == "unknown"
     assert window.progress_bar.value() == 80
