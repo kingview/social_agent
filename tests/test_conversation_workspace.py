@@ -20,10 +20,23 @@ def workspace(tmp_path):
         llm_settings_store=LLMSettingsStore(tmp_path / "llm.json"))
     window = ConversationWorkspace(**options)
     yield window, app, options
-    for pane in window.panes():
+    for pane in window.panes()+list(window.background_panes.values()):
         pane.controller.plan_worker = pane.controller.execution_worker = pane.controller.active_turn_id = None
     window.close()
     app.processEvents()
+
+
+@pytest.fixture
+def history_menus(monkeypatch):
+    from social_ops_agent import conversation_workspace as module
+    menus = []
+
+    class RecordingMenu(module.QMenu):
+        def exec(self, *_args):
+            menus.append(self)
+
+    monkeypatch.setattr(module, "QMenu", RecordingMenu)
+    return menus
 
 
 def test_tabs_keep_independent_context_drafts_and_callbacks(workspace):
@@ -71,6 +84,44 @@ def test_close_and_history_reopen_keeps_transcript(workspace):
     assert window.open_conversation(key) is restored and window.tabs.count() == 2
 
 
+def test_history_hides_empty_tabs_and_unsent_drafts(workspace, history_menus):
+    window, app, _ = workspace
+    first = window.tabs.currentWidget()
+    first_id = first.controller.conversation_id
+    draft = window.open_conversation(create_new=True)
+    draft.message_input.setPlainText("仅输入，尚未发送")
+    window.close_conversation(window.tabs.indexOf(first))
+    # Existing saved empty records stay readable for workspace restoration.
+    assert first_id in {item.conversation_id for item in ConversationCoordinator.catalog(window.state_root)}
+    window._show_history()
+    actions = history_menus[-1].actions()
+    assert len(actions) == 1
+    assert actions[0].text() == "暂无历史对话" and not actions[0].isEnabled()
+    assert draft.message_input.toPlainText() == "仅输入，尚未发送"
+
+
+@pytest.mark.parametrize("status", ["planning", "failed", "cancelled"])
+def test_history_includes_sent_commands_even_if_not_completed(workspace, history_menus, status):
+    window, app, _ = workspace
+    sent = window.tabs.currentWidget()
+    conversation = sent.controller.conversation
+    # Filter by submitted turns, not the title or execution outcome.
+    turn = conversation.begin_turn("新对话")
+    if status == "failed":
+        conversation.mark_failed(turn, stage="planning", error="测试失败")
+    elif status == "cancelled":
+        conversation.mark_cancelled(turn, "测试取消")
+    window.open_conversation(create_new=True)
+    window.close_conversation(window.tabs.indexOf(sent))
+    window._show_history()
+    actions = history_menus[-1].actions()
+    assert [action.text() for action in actions] == [f"新对话 · {conversation.conversation_id[-6:]}"]
+    actions[0].trigger()
+    restored = window.tabs.currentWidget()
+    assert restored.controller.conversation_id == conversation.conversation_id
+    assert restored.controller.conversation.turns[0].user_message == "新对话"
+
+
 def test_restart_restores_tabs_and_selection(workspace):
     window, app, options = workspace
     one = window.tabs.currentWidget()
@@ -112,7 +163,10 @@ def test_cancel_is_scoped_and_shared_plugin_edits_disabled(workspace, monkeypatc
     from social_ops_agent import conversation_workspace as module
     monkeypatch.setattr(module.QMessageBox, "information", lambda *args: notices.append(args))
     window.close_conversation(0)
-    assert window.tabs.count() == 2 and notices
+    assert window.tabs.count() == 1 and not notices
+    assert one.controller.conversation_id in window.background_panes
+    assert window.open_conversation(one.controller.conversation_id) is one
+    assert window.tabs.count() == 2
 
 
 def test_conversation_files_do_not_overwrite_or_recover_each_other(tmp_path):

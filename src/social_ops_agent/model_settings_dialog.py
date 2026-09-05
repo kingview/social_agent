@@ -3,6 +3,7 @@ from __future__ import annotations
 from .diagnostics import record_exception
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QPainter, QPen, QPalette
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -68,6 +69,19 @@ class UniformComboBox(QComboBox):
         view.setItemDelegate(ComboItemDelegate(view))
         self.setView(view)
         self.setMaxVisibleItems(self.MAX_VISIBLE_ROWS)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        # Native macOS arrows can disappear once the popup is styled. Keep a
+        # code-drawn chevron, which also scales cleanly on Retina displays.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        group = QPalette.ColorGroup.Active if self.isEnabled() else QPalette.ColorGroup.Disabled
+        painter.setPen(QPen(self.palette().color(group, QPalette.ColorRole.Text), 1.5))
+        x, y = self.width() - 16, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+        painter.end()
 
     def showPopup(self) -> None:
         visible_rows = max(1, min(self.count(), self.MAX_VISIBLE_ROWS))

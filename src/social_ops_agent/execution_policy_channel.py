@@ -10,7 +10,7 @@ class ExecutionPolicyGrant(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     execution_id: str = Field(min_length=1, max_length=100)
-    max_download_posts: int | None = Field(default=None, ge=1, le=100)
+    max_download_posts: int | None = Field(default=None, ge=1, le=500)
     allowed_session_refs: list[str] = Field(default_factory=list, max_length=12)
     task_id: str | None = None
     steps: list[dict] = Field(default_factory=list)

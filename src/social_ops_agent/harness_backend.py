@@ -24,6 +24,7 @@ from .browser_cleanup import cleanup_task_browsers
 from .browser_scheduler import BrowserTaskScheduler, BrowserWaitCancelled, resources_for_plan
 from .execution_lifecycle import ExecutionLifecycle
 from .execution_tracking import ExecutionTracker
+from .transfer_progress import TransferProgressReader
 from .harness_client import (
     HarnessError,
     HarnessJsonRpcClient,
@@ -366,6 +367,9 @@ class DeepSeekHarnessBackend:
                 f"{self._execute_generation}"
             )
         )
+        transfer_reader = TransferProgressReader(self.state_root, execution_id,
+            lambda message: notify(tracker.progress(message, stage='transfer')))
+        client.activity_probe = transfer_reader.poll
         turn = client.run_turn(
             session_id=execution_session_id,
             content_blocks=content_blocks(
@@ -373,6 +377,8 @@ class DeepSeekHarnessBackend:
                     plan,
                     self.policy,
                     publish_approval_token=approval_token,
+                    resumed_task_context=self.task_store.resume_context(self.conversation_id, plan.resume_turn_id),
+                    context_summary=self.task_store.model_context(self.conversation_id, exclude=plan.task_id),
                 ),
                 tuple(plan.attachments),
             ),

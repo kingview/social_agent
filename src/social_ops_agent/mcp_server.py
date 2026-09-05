@@ -28,6 +28,7 @@ _STANDARD_TYPED_TOOLS = {
     "generate_post_copy",
     "process_watermark",
     "publish_x_post",
+    "run_material_task",
 }
 
 
@@ -133,6 +134,8 @@ async def call_plugin_tool(tool_name: str, arguments: dict[str, Any],
     Use this for capabilities added by future plugins after list_plugin_tools.
     Prefer the typed compatibility Tools below for standard social operations.
     """
+    if tool_name in {'discover_public_materials','download_public_material'}:
+        raise ValueError('素材公开发现与下载请使用 run_material_task，以共享任务记录和执行数量限制')
     if tool_name in _STANDARD_TYPED_TOOLS:
         raise ValueError(
             f"{tool_name} is a standard Tool; call mcp__social__{tool_name} directly"
@@ -182,10 +185,10 @@ def _check_step(tool: str, step_id: str | None, step_item_id: str | None) -> tup
 
 @mcp.tool()
 async def browse_posts(
-    platform: str,
+    platform: Literal['douyin', 'xiaohongshu', 'x', 'telegram'],
     session_ref: str,
-    source: str = "search",
-    view: str = "top",
+    source: Literal['search', 'user', 'timeline', 'url'] = "search",
+    view: Literal['top', 'latest', 'media', 'posts', 'replies', 'users'] = "top",
     query: str | None = None,
     user_key: str | None = None,
     start_url: str | None = None,
@@ -194,7 +197,14 @@ async def browse_posts(
     step_id: str | None = None,
     step_item_id: str | None = None,
 ) -> dict[str, Any]:
-    """Browse Douyin, Xiaohongshu, X, or Telegram Web through the social-content plugin."""
+    """Browse current platform content, NOT saved tasks/history.
+
+    Telegram: source=url with start_url, or source=user with user_key;
+    view=latest (last message), media (skip text-only), or posts. No search/resume.
+    Resume saved downloads using the historical download_media inputs instead.
+    """
+    if platform == 'telegram' and (source not in {'url', 'user'} or view not in {'latest', 'media', 'posts'}):
+        raise ValueError('Telegram browse_posts 只支持 source=url/user、view=latest/media/posts；恢复下载请复用历史 URL 调用 download_media。')
     runtime().require_authorized_session(session_ref)
     return await _invoke_plugin_tool(
         "browse_posts",
@@ -325,6 +335,70 @@ async def download_media(
             )
         )
         return output
+
+
+@mcp.tool()
+async def run_material_task(
+    tool: Literal['discover','download','import','analyze'], items: list[str],
+    options: dict[str, Any] | None = None,
+    step_id: str | None = None, step_item_id: str | None = None,
+) -> dict[str, Any]:
+    """Run phase-one material workflows, sharing toolbox settings and task history.
+
+    discover: one channel URL, or keyword/ID with options platform,source,query/user_key,
+    media_type=both/image/video, days=30, max_items=1..500, sort=latest/top/likes.
+    download: concrete post URLs; optional authorized session_ref, otherwise anonymous.
+    import/analyze: existing output files; analyze also accepts resource:<library-id>.
+    Intake never deletes originals. Analysis uses the configured local model.
+    Returns job_id and per-item results; partial/review states are NOT success.
+    """
+    from .material_service import MaterialService
+    rt = runtime()
+    rt.refresh_execution_policy()
+    if not rt.active_execution_id:
+        raise ValueError('没有活动任务授权')
+    _check_step('run_material_task',step_id,step_item_id)
+    options = dict(options or {})
+    if options.get('session_ref'):
+        rt.require_authorized_session(options['session_ref'])
+    service = MaterialService(rt.output_root,rt.state_root,registry_path=rt.session_registry,plugin_root=rt.manager.root)
+
+    async def execute(selected):
+        job = service.create(tool,selected,options,conversation_id=current_context().get('conversation_id'),execution_id=rt.active_execution_id)
+        with diagnostic_context(execution_id=rt.active_execution_id,task_id=rt.task_id):
+            report = await asyncio.to_thread(service.run_sync,job)
+        return {'job_id':job,'state':report['state'],'completed':report['state']=='已完成',
+            'completed_count':report['completed'],'total':report['total'],'results':report['results'], 'error':report['error']}
+
+    if tool != 'download':
+        return await execute(items)
+    async with rt.download_lock:
+        unique = list(dict.fromkeys(items))
+        remaining = None if rt.max_download_posts is None else max(0,rt.max_download_posts-len(rt.downloaded_post_urls))
+        new = [url for url in unique if url not in rt.downloaded_post_urls]
+        if not new or (remaining is not None and len(new)>remaining):
+            raise ValueError('下载数量超过用户确认的剩余帖子数')
+        remaining_mb = rt.download_budget_remaining_bytes//(1024*1024)
+        if remaining_mb < len(new):
+            raise ValueError('剩余下载容量不足')
+        options['max_total_size_mb'] = min(1000,remaining_mb//len(new))
+        report = await execute(new)
+        for index, result in report['results'].items():
+            payload = result.get('result',{})
+            used = sum(int(a.get('size_bytes') or 0) for a in payload.get('artifacts',[]))
+            rt.download_budget_remaining_bytes = max(0,rt.download_budget_remaining_bytes-used)
+            if result.get('status') == 'completed':
+                rt.downloaded_post_urls.add(new[int(index)])
+        return report
+
+
+@mcp.tool()
+async def list_material_library(query: str = '', analysis_state: str | None = None) -> dict[str, Any]:
+    """Find admitted material IDs and analysis states; no browser session is required."""
+    from .material_service import MaterialService
+    rt=runtime()
+    service=MaterialService(rt.output_root,rt.state_root)
+    return {'resources':service.library().list(query=query,analysis_state=analysis_state)[:500]}
 
 
 @mcp.tool()

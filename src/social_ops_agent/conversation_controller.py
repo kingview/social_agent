@@ -54,6 +54,7 @@ class ConversationController(QObject):
         self.execution_worker = None
         self.active_turn_id = None
         self.pending_plan = None
+        self.requested_resume_task_id = None
         self.last_result = self.conversation.last_result()
         self.phase = ConversationPhase.IDLE
         self.percent = 0
@@ -91,10 +92,14 @@ class ConversationController(QObject):
         self.router = self._new_router()
         self.pending_plan = None
 
-    def start_planning(self, message, *, session, available_sessions, attachment_paths):
+    def start_planning(self, message, *, session, available_sessions, attachment_paths, resume_task_id=None):
         if self.busy:
             return
         context = self.conversation.context_for_next_turn()
+        if resume_task_id:
+            selected = self.conversation.task_store.selected_task_context(resume_task_id, self.conversation_id)
+            context = '\n\n'.join(part for part in (context, selected) if part)
+        self.requested_resume_task_id = resume_task_id
         self.active_turn_id = self.conversation.begin_turn(message,
             attachment_names=[path.name for path in attachment_paths],
             session_ref=session.session_ref if session else None,
@@ -118,6 +123,9 @@ class ConversationController(QObject):
     def accept_plan(self, plan):
         if self.execution_worker is not None:
             return
+        if self.requested_resume_task_id and getattr(plan, 'resume_turn_id', None) != self.requested_resume_task_id:
+            self.fail_planning('恢复计划未关联所选任务，未执行。请重试所选任务，或在对话中明确需要继续的步骤。')
+            return
         self.pending_plan = plan
         if self.active_turn_id:
             self.conversation.mark_planned(self.active_turn_id, plan)
@@ -125,6 +133,7 @@ class ConversationController(QObject):
 
     def fail_planning(self, message):
         self.pending_plan = None
+        self.requested_resume_task_id = None
         self._fail("planning", message)
         self.planning_failed.emit(message)
 
@@ -191,6 +200,7 @@ class ConversationController(QObject):
 
     def finish_execution(self):
         worker, self.execution_worker = self.execution_worker, None
+        self.requested_resume_task_id = None
         if worker is not None:
             worker.deleteLater()
         self.execution_finished.emit()
@@ -203,6 +213,7 @@ class ConversationController(QObject):
         self.conversation.new_conversation()
         self.router = self._new_router()
         self.pending_plan = self.last_result = None
+        self.requested_resume_task_id = None
         self.phase = ConversationPhase.IDLE
         self.changed.emit()
 

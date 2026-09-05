@@ -44,6 +44,7 @@ class HarnessJsonRpcClient:
         self._cwd = cwd.resolve()
         self._env = dict(env)
         self._timeout_seconds = timeout_seconds
+        self.activity_probe: Callable[[], bool] | None = None
         self._process: subprocess.Popen[str] | None = None
         self._responses: dict[str, queue.Queue[object]] = {}
         self._notifications: queue.Queue[object] = queue.Queue()
@@ -143,12 +144,19 @@ class HarnessJsonRpcClient:
             raise HarnessError("Harness session/prompt returned an invalid response")
         message_id = response["messageId"]
         deadline = time.monotonic() + self._timeout_seconds
+        hard_deadline = time.monotonic() + 24 * 3600
         received = False
         events: list[JsonObject] = []
         while True:
+            if self.activity_probe is not None:
+                try:
+                    if self.activity_probe():
+                        deadline = time.monotonic() + self._timeout_seconds
+                except TimeoutError as exc:
+                    raise HarnessError(str(exc)) from exc
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HarnessError(self._diagnostic("Harness turn timed out"))
+            if remaining <= 0 or time.monotonic() >= hard_deadline:
+                raise HarnessError(self._diagnostic("Harness 执行等待超时：长时间没有新的执行进展，或已达到 24 小时上限。"))
             try:
                 item = self._notifications.get(timeout=min(remaining, 0.25))
             except queue.Empty:
@@ -169,6 +177,8 @@ class HarnessJsonRpcClient:
                 if _is_inbox_receipt(event, message_id):
                     received = True
                 if received:
+                    if event.get('type') in {'tool/call', 'tool/result', 'assistant/chunk', 'assistant/message'}:
+                        deadline = time.monotonic() + self._timeout_seconds
                     events.append(event)
                     if on_event is not None:
                         on_event(event)

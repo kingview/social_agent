@@ -7,6 +7,7 @@ from typing import Any
 from .contracts import AgentProgress, DynamicAgentPlan
 from .step_binding import resolve_step
 from .tool_results import result_payload, successful_result
+from .resume_evidence import resume_input, resume_output
 
 
 class ExecutionTracker:
@@ -48,6 +49,9 @@ class ExecutionTracker:
         self.calls[call_id] = (short, binding)
         self.call_records[call_id] = {"tool": short, "step_id": self.steps[index]["step_id"] if index is not None else None,
                                       "step_item_id": binding[1] if binding else None, "status": "running"}
+        evidence = resume_input(short, arguments)
+        if evidence:
+            self.call_records[call_id]['resume_input'] = evidence
         if short == "publish_x_post":
             self.publish_state = "unknown"
         message = (
@@ -72,6 +76,10 @@ class ExecutionTracker:
             payload = result_payload(block.get("content"))
             successful = not block.get("isError") and successful_result(short, payload)
             self.call_records[call_id]["status"] = "succeeded" if successful else "failed"
+            if not block.get('isError'):
+                evidence = resume_output(short, payload)
+                if evidence:
+                    self.call_records[call_id]['resume_output'] = evidence
             if short == "publish_x_post":
                 state = payload.get("state") if payload else None
                 self.publish_state = (

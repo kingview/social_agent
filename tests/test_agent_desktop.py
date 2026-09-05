@@ -8,7 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from social_ops_agent.desktop import AUTO_SESSION_REF, ExecutionWorker, MainWindow, _chat_message_html
 from social_ops_agent.contracts import (
@@ -83,6 +83,7 @@ def test_desktop_has_single_send_control(tmp_path: Path) -> None:
     )
 
     assert "社媒任务助手" in window.windowTitle()
+    assert window.findChild(QLabel, "eyebrow") is None
     assert window.session_combo.itemText(0) == "根据任务自动选择窗口"
     assert window.session_combo.currentData() == AUTO_SESSION_REF
     assert window.session_combo.itemText(1).startswith("抖音")
@@ -319,6 +320,20 @@ def test_execution_progress_is_rendered_in_agent_chat_by_completed_steps(
     assert window.progress_value.text() == "40%"
     assert "总进度 40%" in window.chat.toPlainText()
     assert "第 3/5 步" in window.chat.toPlainText()
+    window.close()
+    app.processEvents()
+
+
+def test_transfer_progress_replaces_card_without_changing_step_percentage(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(registry_path=tmp_path/'sessions.json', output_root=tmp_path/'downloads',
+        plugin_root=tmp_path/'plugins', llm_settings_store=LLMSettingsStore(tmp_path/'llm.json',credentials=MemoryCredentials()))
+    for message in ('video.mp4 10 MiB 100 KiB/s', 'video.mp4 20 MiB 120 KiB/s'):
+        window.controller.report_execution(AgentProgress(stage='transfer',completed=1,total=2,message=message))
+    assert window.progress_bar.value() == 50
+    assert '20 MiB' in window.chat.toPlainText()
+    assert '10 MiB' not in window.chat.toPlainText()
+    assert window.chat.toPlainText().count('video.mp4') == 1
     window.close()
     app.processEvents()
 

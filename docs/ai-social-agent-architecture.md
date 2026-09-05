@@ -644,6 +644,8 @@ tools/
 
 所有独立 Tool 的 macOS/Windows 客户端统一使用 PySide6/Qt 桌面框架，并复用深色主题、拖放输入、后台 Worker、进度状态、结果卡片和本地目录操作模式；不为单个 Tool 混入 Web UI 或 Electron。`media.process_watermark` 另提供独立 Watermark Studio GUI，可预览检测区域，并在一次批量授权确认后生成衍生视频。
 
+窗口管理器可扫描比特浏览器 Local API 的全部 Profile，以名称开头的明确平台前缀（DY/抖音、XHS/小红书、X/Twitter、TG/Telegram）判断平台，验证登录后批量注册。名称不符合规则的 Profile 不会被猜测，已注册的 API + Profile 组合保留原引用。
+
 `social.download_media` 的登录态输入使用不透明 `session_ref`，不允许 Agent 直接传 Cookie、账号密码、验证码、代理或指纹。MVP 的 `session_ref` 由 PostDrop 在本机按抖音、小红书、X 或 Telegram Web 分别生成，映射到用户已手动登录的比特浏览器 Profile；注册表只保存平台、Profile 引用和本机 API 地址。桌面端默认把已注册窗口的最小元数据（平台、窗口名、不透明引用）作为候选交给 Planning Harness；模型根据用户提示中的平台、窗口名、账号用途和步骤返回一个或多个候选引用，核心再对照本地注册表验证。跨平台流程因此可以先在素材窗口浏览下载，再在 X 窗口发布；手动下拉选择仍可锁定唯一窗口。每轮执行策略文件携带允许引用集合，MCP 在每次浏览、下载或发布前机械校验，模型虚构或越权切换窗口会被拒绝。抖音、小红书和 X 的单次登录态下载经比特浏览器本地接口在进程内读取对应平台域 Cookie 和该 Profile 的代理；Telegram 不导出 Cookie，而是在已登录页面上下文内读取消息和分块获取媒体，因此自然沿用 Profile 代理。Telegram 频道全量任务由下载 Tool 内部的确定性状态机执行：稳定输出目录按会话、频道和媒体格式派生，逐条写入 JSONL manifest，重试时跳过已完成消息，并以消息数、总容量、页面停滞或到达顶部作为显式终止条件。配置代理时输出 `bitbrowser_profile_proxy`，Profile 为 `noproxy` 时输出 `direct`，均不包含代理详情。当前实现不自动登录、不修改或轮换代理和指纹；未来多租户服务端应把映射迁移到 Credential Service/Vault，并增加租户绑定、租约、撤销、并发锁和会话健康状态机。
 
 `social.browse_posts` 与下载 Tool 分离。它通过本轮计划授权的平台专属 `session_ref` 找到比特浏览器 Profile，调用 `/browser/open` 获得本机 CDP 地址，由 Playwright 在临时标签页完成抖音、小红书或 X 的关键词搜索、分类结果、用户主页、推荐/时间线或指定页面的受限只读导航。平台层使用独立路由构造器、DOM 采集器与 URL 规范化器；当前实现借鉴 MediaCrawler 的平台适配器分层思路，但不复制其受非商用学习许可证约束的代码、签名算法或私有接口实现。输出只包含帖子候选与证据字段，不下载媒体，也不执行任何平台写操作。同一窗口必须串行执行，限制最大条数、滚动次数、等待时间和超时；一次任务可以按计划顺序使用多个不同窗口。页面文本视为不可信输入。Profile 的代理和指纹由比特浏览器预先配置，Tool 执行期间不自动修改。浏览 Profile → 提取 URL → 下载 → 分析 → 生成 → 可选审批后发布 X 构成可审计的组合工作流。
@@ -722,6 +724,23 @@ Host 队列逐请求快照，后台常驻任务不继承第一条请求上下文
 权限判断或环境配置。异常源产生 `error_id`，只写一次完整异常，跨进程通过响应 `_meta` 关联，
 上层仅记传播位置和同一错误 ID；缺少元数据的旧插件仍兼容。回归覆盖真实 MCP 子进程连续/并发请求、
 线程内降级、参数校验、重复错误关联和凭据脱敏。具体目录与保留规则见 README 的“开发期异常日志”。
+
+下载进度使用本地按 execution_id 隔离的 `transfer-progress/<execution_id>.json` 通道，Tool
+原子写入文件名、字节数、速度及文件/帖子序号，Agent 轮询并更新同一进度卡片；步骤百分比仍由
+ExecutionTracker 的已完成步骤决定。字节/文件有实际增长才续期 Harness 的 30 分钟空闲期限，
+状态心跳不续期；下载阶段 120 秒无实际进展报错，总执行时长保留 24 小时硬上限。
+Telegram 分片请求 45 秒超时，读取与写入间检查 execution policy 撤销，避免 GUI 结束后继续
+后台下载；失败不删除已完成媒体或 `.part`，相同请求核对大小和分片范围后续传。传输事件单独
+保存在 `logs/transfer-<execution_id>.jsonl`，不含 URL、正文或凭据。
+
+跨重启续接不依赖 Harness 会话仍在内存：ExecutionTracker 在工具调用前保存白名单下载请求
+（原帖子 URL 顺序、格式和大小限制），结果返回后保存浏览 URL 列表及下载输出路径，随步骤检查点
+写入 TaskStore。Planning 接收最近任务的续接证据；Execution 按 `resume_turn_id` 回溯本对话任务链，
+单独接收 `resumed_task_context`，避免普通上下文裁剪丢失原目标。旧版本任务可按任务日志中的
+精确 Tool call ID，从同一对话的 Harness JSONL 恢复白名单字段；不保存原始参数、正文或授权凭据，
+不从恢复信息授予新权限、不自动重放发布。已存在下载请求时复用原批次，不重新浏览频道选取；
+实际选中数量不足目标数量时明确报告，不能补造 URL。浏览 Tool 的 source/view 通过枚举 schema
+公开，不支持 `source=resume`，Telegram 不支持 `source=search`。
 
 macOS/Windows 桌面端采用“轻量 Agent Core + 用户级 Tool 插件”部署，不再把所有 Tool 依赖复制进 `SocialAgent.app`：
 
@@ -1806,3 +1825,17 @@ Next.js
 ```
 
 第一版桌面端已引入锁版本 DeepSeek Harness，但不引入完整 LangChain 和 LangGraph。服务端出现复杂图、多 Agent 复核或 Harness 暂不覆盖的持久化需求后，可在 `AgentRuntimeAdapter` 后加入 LangGraph。LangChain 只在某个 Tool、Retriever 或 RAG 组件能明显降低实现成本时局部采用。
+
+## 22. 桌面素材工作流增量（2026-09-06）
+
+此部分描述当前桌面实现，不表示前文服务端目标组件均已部署。
+
+- `ConversationWorkspace` 负责导航、独立对话与全局任务视图；`workspace_theme.py` 集中维护浅色工作台/深蓝侧栏样式，旧能力入口保留。
+- `material_desktop.py` 保留兼容导出；`material_ui/` 按工具窗口、任务面板、素材库、设置与表现控制器拆分。手工操作与 Harness 的 `run_material_task` 共用 `MaterialService`，四种流程委派至 `material_workflows/` 的独立处理器，数据库 SQL 留在仓储层。
+- `MaterialJobs` 将参数快照、输入、逐项结果和状态写入 `.social-agent-state/material-tasks.sqlite3`；`MaterialRunner` 在项目检查点处理暂停/停止，重试跳过已完成项。跨进程操作使用 SQLite 事务，执行/恢复使用 OS 文件锁，避免桌面启动误恢复活跃 MCP 任务。
+- `MaterialLibrary` 在用户配置的素材库根目录维护 `resources.db`；失败检查只建立问题记录，合格文件复制并校验，数据库事务失败回收本次新建副本，源文件不删除。哈希和复制不占写事务，提交时重新检查重复；资源、成功检查记录和同任务入库回执原子提交。分析/策略评分/人工复核及使用状态分别存储。
+- 分析开始时领取 `analysis_job_id` 与 `analysis_lease_id`，过期执行者不能提交结果。恢复在任务执行锁内按任务原配置释放该任务未完成租约；已提交分析和入库回执可在任务检查点丢失时重放，不重复推理。模型槽位等待也响应暂停/停止；恢复与旧 worker 清理重叠时保留恢复请求。
+- `material_settings.py` 保存素材库/下载目录、本机模型、分析规则、策略组和并发。素材分析按需求使用本机模型，不覆盖现有 Agent 远端 LLM 设置。`material_limits.py` 使用跨进程模型槽位限制并发。
+- 社媒插件提供标准浏览器公开链接发现与公开帖子下载；媒体插件提供 `inspect_material` 检查/修复/复检和扩展分析字段。重依赖仍留在 `.socialtool` 插件中，Agent App 不内置 OpenCV/推理模型。
+- `TaskCenter` 是 UI 的统一任务查询/控制接口，聚合既有 `TaskStore` 与素材任务记录，保留两者持久化格式与执行边界。列表只读取分页摘要，选中任务按 revision 加载详情；只读查询不保留 SQLite 写锁。
+- Agent 的停止操作定向到所属对话的实际 worker；恢复会开启新一轮 Harness 规划并绑定所选 `resume_turn_id`，保留未发送草稿/附件。发布幂等与原有授权校验不变，不直接重放发布，也不把原任务文本伪装成新授权。素材任务仍用持久命令和逐项检查点；不宣称已经合并调度器，Agent 没有原生暂停时不提供假暂停按钮。完整一期缺口见 `phase1-implementation.md`。

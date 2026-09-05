@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+import os
+import time
 
 
 def emit(value: dict) -> None:
@@ -24,6 +26,7 @@ for raw_line in sys.stdin:
         session_id = params["sessionId"]
         message_id = uuid.uuid4().hex
         emit({"jsonrpc": "2.0", "id": request_id, "result": {"messageId": message_id}})
+        time.sleep(float(os.environ.get('FAKE_HARNESS_DELAY', '0')))
         emit(
             {
                 "jsonrpc": "2.0",

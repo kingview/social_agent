@@ -4,13 +4,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, QUrl, Signal
+from PySide6.QtCore import QTimer, QUrl, Signal, Qt
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QMessageBox,
     QListWidget,
@@ -49,6 +50,7 @@ PLATFORM_LABELS = {
 class ConversationPane(QWidget):
     new_conversation_requested = Signal()
     conversation_changed = Signal()
+    material_tool_requested = Signal(str)
 
     def __init__(
         self,
@@ -91,7 +93,7 @@ class ConversationPane(QWidget):
 
         self.setWindowTitle("Social Agent · 社媒任务助手")
         self.resize(1_020, 760)
-        self.setMinimumSize(780, 620)
+        self.setMinimumSize(540 if managed else 780, 620)
         self.setAcceptDrops(True)
         self._build_ui()
         self.controller.changed.connect(self.conversation_changed)
@@ -109,18 +111,18 @@ class ConversationPane(QWidget):
     def _build_ui(self) -> None:
         self.setObjectName("root")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(34, 28, 34, 28)
+        layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        eyebrow = QLabel("LOCAL TOOL ORCHESTRATOR")
-        eyebrow.setObjectName("eyebrow")
         title = QLabel("Social Agent")
         title.setObjectName("title")
         subtitle = QLabel("所有自然语言命令由 DeepSeek Harness 理解并编排；发送后自动执行。")
         subtitle.setObjectName("subtitle")
-        title_box.addWidget(eyebrow)
+        subtitle.setWordWrap(True)
+        if self._managed:
+            title.hide(); subtitle.hide()
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
@@ -139,7 +141,8 @@ class ConversationPane(QWidget):
         header.addWidget(self.model_button)
         header.addWidget(self.plugins_button)
         header.addWidget(self.new_chat_button)
-        layout.addLayout(header)
+        if not self._managed:
+            layout.addLayout(header)
 
         session_card = QFrame()
         session_card.setObjectName("card")
@@ -162,6 +165,28 @@ class ConversationPane(QWidget):
         self.chat.setOpenExternalLinks(False)
         self.chat.setPlaceholderText("例如：通过关键词“web3”在抖音上搜索并下载前100个帖子")
         layout.addWidget(self.chat, 1)
+        self.welcome = QFrame()
+        self.welcome.setObjectName('welcomeCard')
+        welcome_layout=QVBoxLayout(self.welcome)
+        welcome_layout.setContentsMargins(18,20,18,16)
+        welcome_layout.setSpacing(16)
+        welcome_layout.addStretch()
+        mark=QLabel('S'); mark.setObjectName('welcomeMark'); mark.setFixedSize(58,58); mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(mark,0,Qt.AlignmentFlag.AlignHCenter)
+        welcome_title=QLabel('你好，今天想完成什么？'); welcome_title.setObjectName('welcomeTitle'); welcome_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(welcome_title)
+        welcome_subtitle=QLabel('从发现灵感到素材入库，交给 Agent 帮你串联。'); welcome_subtitle.setObjectName('welcomeSubtitle'); welcome_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter); welcome_subtitle.setWordWrap(True)
+        welcome_layout.addWidget(welcome_subtitle)
+        quick=QGridLayout(); quick.setSpacing(10)
+        for i,(key,label) in enumerate([('discover','↗  发现链接\n按来源筛选图文与视频'),('download','↓  下载资源\n保存媒体与随附文字'),('import','◇  素材入库\n检查、修复与自动去重'),('analyze','◎  分析内容\n提取标签与策略评分')]):
+            action=QPushButton(label); action.setObjectName('quickTask'); action.setMinimumHeight(65)
+            action.clicked.connect(lambda _=False,tool=key:self.material_tool_requested.emit(tool))
+            quick.addWidget(action,i//2,i%2)
+        welcome_layout.addLayout(quick)
+        welcome_layout.addStretch()
+        self.welcome.setVisible(self._managed and not self.controller.conversation.turns)
+        self.chat.setVisible(not (self._managed and not self.controller.conversation.turns))
+        layout.addWidget(self.welcome,1)
 
         self.progress_frame = QFrame()
         self.progress_frame.setObjectName("progressFrame")
@@ -201,8 +226,9 @@ class ConversationPane(QWidget):
         input_layout.addWidget(self.attachment_list)
 
         action_row = QHBoxLayout()
-        hint = QLabel("浏览、下载与本地处理 · X 发布须单独确认 · 不自动登录")
+        hint = QLabel("图片、视频、音频均可作为任务输入")
         hint.setObjectName("hint")
+        hint.setVisible(not self._managed)
         self.attach_button = QPushButton("＋ 图片 / 视频 / 音频")
         self.attach_button.setObjectName("secondaryButton")
         self.attach_button.clicked.connect(self.choose_attachments)
@@ -225,6 +251,8 @@ class ConversationPane(QWidget):
         action_row.addWidget(self.send_button)
         input_layout.addLayout(action_row)
         layout.addWidget(input_frame)
+        if self._managed:
+            layout.addLayout(header)
 
         if self.controller.conversation.turns:
             self._restore_conversation()
@@ -379,8 +407,29 @@ class ConversationPane(QWidget):
             self._llm_settings = hydrated
         return True
 
+    def resume_task(self, task_id: str) -> bool:
+        """Continue an explicitly selected task without consuming an unsent draft."""
+        if self.controller.busy:
+            raise ValueError('此对话仍在执行任务，请等待或停止当前任务后继续')
+        # Validate ownership before touching the view or loading model credentials.
+        self.controller.conversation.task_store.selected_task_context(task_id, self.controller.conversation_id)
+        if not self._ensure_llm_secret():
+            return False
+        message = f'继续任务 {task_id} 未完成的部分，保留已完成结果。请将 resume_turn_id 设为该任务 ID。'
+        self._append_user(message)
+        self._last_progress_message = ''
+        self._set_planning(True)
+        available_sessions = tuple(
+            SelectedSession(session_ref=item.session_ref, platform=item.platform, profile_name=item.profile_name)
+            for item in self._registry.list()
+        )
+        self.controller.start_planning(message, session=None, available_sessions=available_sessions,
+            attachment_paths=[], resume_task_id=task_id)
+        return True
+
     def _plan_succeeded(self, plan: RuntimePlan) -> None:
-        self.clear_attachments()
+        if not self.controller.requested_resume_task_id:
+            self.clear_attachments()
         if isinstance(plan, DynamicAgentPlan):
             selected_sessions = plan.authorized_browser_sessions()
             if selected_sessions:
@@ -439,7 +488,20 @@ class ConversationPane(QWidget):
         self.progress_bar.setValue(max(0, min(percent, 100)))
         self.progress_value.setText(f"{percent}%")
         self.progress_label.setText(event.message)
-        self._append_progress_message(event.message, percent=percent)
+        if event.stage == 'transfer':
+            baseline = getattr(self, '_transfer_history_html', None)
+            if baseline is None:
+                baseline = self.chat.toHtml()
+                self._transfer_history_html = baseline
+            card = _chat_message_html('Agent', _html(f'总进度 {percent}% · {event.message}').replace('\n', '<br>'), side='left')
+            bar = self.chat.verticalScrollBar()
+            at_end = bar.value() >= bar.maximum() - 4
+            position = bar.value()
+            self.chat.setHtml(baseline.replace('</body>', card + '</body>'))
+            bar.setValue(bar.maximum() if at_end else position)
+        else:
+            self._transfer_history_html = None
+            self._append_progress_message(event.message, percent=percent)
         self.conversation_changed.emit()
 
     def _execution_succeeded(self, result: AgentExecutionResult) -> None:
@@ -680,6 +742,8 @@ class ConversationPane(QWidget):
         self.conversation_changed.emit()
 
     def _append_user(self, message: str, *, attachments: list[Path] | None = None) -> None:
+        self.welcome.hide()
+        self.chat.show()
         attached = ""
         if attachments:
             names = "、".join(_html(path.name) for path in attachments)
@@ -688,6 +752,10 @@ class ConversationPane(QWidget):
         self.chat.append(_chat_message_html("你", body, side="right"))
 
     def _append_agent(self, message: str, *, error: bool = False) -> None:
+        if error:
+            self.welcome.hide()
+            self.chat.show()
+        self._transfer_history_html = None
         self.chat.append(
             _chat_message_html(
                 "Agent",

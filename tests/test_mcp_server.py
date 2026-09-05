@@ -15,6 +15,8 @@ from social_ops_agent.policy import ExecutionPolicy
 def test_mcp_exposes_typed_tools_and_the_plugin_bridge() -> None:
     assert set(mcp._tool_manager._tools) == {
         "list_plugin_tools",
+        "run_material_task",
+        "list_material_library",
         "call_plugin_tool",
         "browser_operate",
         "browse_posts",
