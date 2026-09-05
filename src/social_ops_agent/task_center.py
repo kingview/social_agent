@@ -88,7 +88,7 @@ class TaskCenter:
             results = row.get('results') or {}
             for index, item in enumerate(row.get('items', [])):
                 checkpoint = results.get(str(index), {})
-                label = {'completed': '已完成', 'failed': '失败', 'review': '待复核'}.get(checkpoint.get('status'), '待处理')
+                label = {'completed': '已完成', 'failed': '失败', 'review': '待复核', 'partial':'部分完成'}.get(checkpoint.get('status'), '待处理')
                 lines.append(f'{index + 1}. {item} · {label}')
                 payload = checkpoint.get('result') or {}
                 detail = checkpoint.get('error') or payload.get('error') or payload.get('summary')
@@ -96,6 +96,11 @@ class TaskCenter:
                     lines.append(str(detail))
                 if payload.get('issues'):
                     lines.append('；'.join(map(str, payload['issues'])))
+                if 'requested' in payload and 'found' in payload:
+                    lines.append(f'有效链接 {payload.get("count",0)}/{payload["requested"]}；发现 {payload["found"]}；'
+                                 f'筛选排除 {payload.get("filtered_out",0)}；重复 {payload.get("skipped_duplicates",0)}')
+                if payload.get('warnings'):
+                    lines.extend(map(str,payload['warnings']))
                 target = self._payload_directory(payload)
                 if target:
                     lines.append('输出：' + str(target))

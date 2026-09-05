@@ -23,11 +23,16 @@ class ToolController:
         options = dict(options)
         if self.tool == 'discover':
             source = options['source']
+            if source != 'timeline' and (not raw.strip() or len(raw.splitlines()) != 1):
+                raise ValueError('请填写一个账号、关键词或来源链接')
             if source == 'search':
                 options['query'] = raw
             if source == 'user':
-                options['user_key'] = raw
-            items = [raw or 'timeline']
+                if raw.startswith('https://'):
+                    options['source'] = 'url'
+                else:
+                    options['user_key'] = raw
+            items = ['timeline' if source == 'timeline' else raw]
         elif self.tool == 'download':
             items, rejected = parse_links(raw)
             if rejected:

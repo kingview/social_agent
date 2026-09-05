@@ -59,13 +59,13 @@ QWidget#materialTasks { background:#fcfdff; border-left:1px solid #e4e9f2; }
 QLabel { color:#64738c; border:none; background:transparent; }
 QLabel#sectionTitle { font-size:22px; font-weight:750; color:#1d2c4c; }
 QLabel#taskHeading { font-size:15px; font-weight:700; color:#243656; }
-QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox {
+QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {
  background:white; color:#334662; border:1px solid #dde4ef; border-radius:8px; padding:7px;
 }
 QListWidget { outline:none; }
 QListWidget::item { padding:13px 9px; margin:3px; border:1px solid #e4eaf3; border-radius:8px; }
 QListWidget::item:selected { background:#edf3ff; color:#2859ed; border-color:#adc4fe; }
-QPushButton { background:white; color:#5e6f89; border:1px solid #d8e1ef; padding:0 10px; }
+QPushButton { background:white; color:#5e6f89; border:1px solid #d8e1ef; padding:0 10px; min-height:38px; border-radius:8px; }
 QPushButton:hover { background:#edf3ff; border-color:#a9bef5; color:#2859ed; }
 QPushButton:disabled { background:#f1f4f8; color:#a3adbd; border-color:#e3e8f0; }
 QPushButton#primaryButton { background:#2859ed; border-color:#2859ed; color:white; }
@@ -77,4 +77,10 @@ QFrame#toolCard { background:white; border:1px solid #e2e8f2; border-radius:14px
 QLabel#toolName { font-size:17px; font-weight:700; color:#253655; }
 QLabel#toolIcon { font-size:22px; font-weight:700; color:#2859ed; background:#edf2ff; border-radius:10px; }
 QLabel#toolState { font-size:11px; color:#8e9bb0; }
+QTabWidget::pane { border:none; background:transparent; padding-top:8px; }
+QTabBar::tab { background:#edf1f8; color:#64738c; border:none; padding:11px 16px; margin-right:5px; border-radius:7px; }
+QTabBar::tab:selected { background:#e4ecff; color:#2859ed; }
+QCheckBox { color:#334662; spacing:8px; }
+QCheckBox::indicator { width:18px; height:18px; border:1px solid #b9c6db; border-radius:4px; background:white; }
+QCheckBox::indicator:checked { background:#2859ed; border-color:#2859ed; }
 '''

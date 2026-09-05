@@ -46,6 +46,8 @@ def item_status(result):
         raise ValueError('工具返回的项目结果必须为对象')
     if result.get('needs_human_review') or result.get('analysis_state') == '需复核':
         return 'review'
+    if result.get('completed') is False and (result.get('posts') or result.get('artifacts')):
+        return 'partial'
     if result.get('intake_state') == '未通过' or result.get('completed') is False:
         return 'failed'
     return 'completed'
@@ -56,4 +58,4 @@ def outcome(results, total):
         return TaskState.REVIEW.value
     completed = sum(item.get('status') == 'completed' for item in results.values())
     return (TaskState.COMPLETED if completed == total else
-            TaskState.PARTIAL if completed else TaskState.FAILED).value
+            TaskState.PARTIAL if completed or any(item.get('status')=='partial' for item in results.values()) else TaskState.FAILED).value

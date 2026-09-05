@@ -5,7 +5,7 @@ from functools import partial
 from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, QSize, QTimer, Slot
 from PySide6.QtGui import QDesktopServices, QImageReader, QPixmap
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QMessageBox, QListWidget, QListWidgetItem, QAbstractItemView
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QMessageBox, QListWidget, QListWidgetItem, QAbstractItemView, QSpinBox
 from ..diagnostics import record_exception
 from ..workspace_theme import MATERIAL_STYLE
 from .controls import button, combo, error
@@ -30,11 +30,21 @@ class MaterialLibraryDialog(QDialog):
         self.resize(900,680)
         layout=QVBoxLayout(self)
         title=QLabel('素材库'); title.setObjectName('sectionTitle'); layout.addWidget(title)
-        self.search=QLineEdit(); self.search.setPlaceholderText('搜索素材名、主题或 ID'); layout.addWidget(self.search)
+        self.search=QLineEdit(); self.search.setPlaceholderText('搜索素材名、主题、标签、分析内容、人工分组或 ID'); layout.addWidget(self.search)
         filters=QHBoxLayout()
         self.analysis_filter=combo([('全部分析状态',None)]+[(s,s) for s in ('未分析','分析中','已分析','需复核','分析失败')])
         self.usage_filter=combo([('全部使用状态',None)]+[(s,s) for s in ('未使用','已占用','已使用','停用','已删除')])
         filters.addWidget(self.analysis_filter); filters.addWidget(self.usage_filter); layout.addLayout(filters)
+        more_filters=QHBoxLayout()
+        settings=service.settings()
+        self.media_filter=combo([('全部媒体',None),('图片','image'),('视频','video')])
+        self.theme_filter=combo([('全部主题',None)]+[(s,s) for s in settings.themes])
+        self.strategy_filter=combo([('全部策略',None)]+[(r.name+' · 建议使用',r.name) for r in settings.strategies])
+        self.quality_filter=QSpinBox(); self.quality_filter.setRange(-1,100); self.quality_filter.setValue(-1)
+        self.quality_filter.setSpecialValueText('不限质量分'); self.quality_filter.setPrefix(''); self.quality_filter.setToolTip('基础质量分不低于此值；不限时包含未分析素材')
+        for control in (self.media_filter,self.theme_filter,self.strategy_filter,self.quality_filter):
+            control.setMinimumHeight(38); more_filters.addWidget(control)
+        layout.addLayout(more_filters)
         self.list=QListWidget(); layout.addWidget(self.list)
         pages = QHBoxLayout()
         self.previous_page = button('上一页', lambda:self.change_page(-1), pages)
@@ -64,6 +74,8 @@ class MaterialLibraryDialog(QDialog):
         self.search.textChanged.connect(lambda:self.search_timer.start())
         self.analysis_filter.currentIndexChanged.connect(self.reset_page)
         self.usage_filter.currentIndexChanged.connect(self.reset_page)
+        for control in (self.media_filter,self.theme_filter,self.strategy_filter): control.currentIndexChanged.connect(self.reset_page)
+        self.quality_filter.valueChanged.connect(self.reset_page)
         self.list.currentItemChanged.connect(self.selected)
         self.refresh()
 
@@ -78,7 +90,9 @@ class MaterialLibraryDialog(QDialog):
     def refresh(self,*_):
         current = self.list.currentItem()
         selected_id = current.data(Qt.ItemDataRole.UserRole) if current else None
-        rows = self.controller.list(query=self.search.text(), analysis_state=self.analysis_filter.currentData(), usage_state=self.usage_filter.currentData(), limit=100, offset=self._offset)
+        rows = self.controller.list(query=self.search.text(), analysis_state=self.analysis_filter.currentData(), usage_state=self.usage_filter.currentData(),
+            media_type=self.media_filter.currentData(),theme=self.theme_filter.currentData(),strategy=self.strategy_filter.currentData(),
+            minimum_quality=self.quality_filter.value() if self.quality_filter.value()>=0 else None,limit=100,offset=self._offset)
         if not rows and self._offset:
             self._offset = max(0,self._offset-100)
             return self.refresh()

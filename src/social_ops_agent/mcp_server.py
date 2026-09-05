@@ -347,6 +347,10 @@ async def run_material_task(
 
     discover: one channel URL, or keyword/ID with options platform,source,query/user_key,
     media_type=both/image/video, days=30, max_items=1..500, sort=latest/top/likes.
+    Discovery options also accept start_date/end_date (ISO dates), access_interval_seconds
+    (0.3..30), timeout_seconds (10..3600), browser_engine=standard/bitbrowser,
+    execution_mode=automation/rpa. BitBrowser requires an authorized session_ref;
+    Telegram public discovery always uses standard+automation, not Telegram Web.
     download: concrete post URLs; optional authorized session_ref, otherwise anonymous.
     import/analyze: existing output files; analyze also accepts resource:<library-id>.
     Intake never deletes originals. Analysis uses the configured local model.
@@ -393,12 +397,26 @@ async def run_material_task(
 
 
 @mcp.tool()
-async def list_material_library(query: str = '', analysis_state: str | None = None) -> dict[str, Any]:
-    """Find admitted material IDs and analysis states; no browser session is required."""
+async def list_material_library(
+    query: str = '', analysis_state: str | None = None, usage_state: str | None = None,
+    media_type: Literal['image','video'] | None = None, theme: str | None = None,
+    minimum_quality: float | None = None, strategy: str | None = None,
+    limit: int = 100, offset: int = 0,
+) -> dict[str, Any]:
+    """Search admitted material/analysis/tags, with the same filters as the library UI.
+
+    strategy selects materials recommended by that saved strategy. minimum_quality
+    is a 0..100 quality threshold (unknown scores do not match). Paginate with
+    next_offset; no browser is opened and no analysis or publication is triggered.
+    """
     from .material_service import MaterialService
+    if isinstance(limit,bool) or not 1<=limit<=500 or isinstance(offset,bool) or offset<0:
+        raise ValueError('分页数量必须为 1..500，偏移不能为负数')
     rt=runtime()
     service=MaterialService(rt.output_root,rt.state_root)
-    return {'resources':service.library().list(query=query,analysis_state=analysis_state)[:500]}
+    rows=service.library().list(query=query,analysis_state=analysis_state,usage_state=usage_state,
+        media_type=media_type,theme=theme,minimum_quality=minimum_quality,strategy=strategy,limit=limit+1,offset=offset)
+    return {'resources':rows[:limit],'next_offset':offset+limit if len(rows)>limit else None}
 
 
 @mcp.tool()

@@ -8,7 +8,8 @@ from PySide6.QtGui import QImage, QColor
 from social_ops_agent.conversation_workspace import ConversationWorkspace
 from social_ops_agent.desktop_support import STYLESHEET
 from social_ops_agent.settings import LLMSettingsStore
-from social_ops_agent.material_desktop import MaterialLibraryDialog
+from social_ops_agent.material_desktop import MaterialLibraryDialog,MaterialSettingsDialog
+from social_ops_agent.material_ui.strategy_editor import StrategyDialog
 from social_ops_agent.material_library import digest_file
 
 
@@ -30,6 +31,15 @@ def main():
         workspace.toolbox.open_tool('import'); app.processEvents()
         workspace.toolbox.dialogs['import'].grab().save(str(args.output/'intake.png'))
         workspace.toolbox.dialogs['import'].close()
+        workspace.toolbox.open_tool('discover'); app.processEvents()
+        workspace.toolbox.dialogs['discover'].grab().save(str(args.output/'discovery.png'))
+        workspace.toolbox.dialogs['discover'].close()
+        settings_dialog=MaterialSettingsDialog(workspace.material_service)
+        settings_dialog.show(); app.processEvents()
+        settings_dialog.grab().save(str(args.output/'material-settings.png')); settings_dialog.close()
+        strategy_dialog=StrategyDialog()
+        strategy_dialog.show(); app.processEvents()
+        strategy_dialog.grab().save(str(args.output/'strategy-editor.png')); strategy_dialog.close()
         # Synthetic data for layout only; this does not exercise real admission quality checks.
         source=root/'layout-sample.png'
         sample=QImage(320,240,QImage.Format.Format_RGB32); sample.fill(QColor('#b8cafa')); sample.save(str(source))

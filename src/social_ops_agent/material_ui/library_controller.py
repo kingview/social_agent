@@ -12,10 +12,10 @@ class LibraryController:
         self.service = service
         self.runner = runner
 
-    def list(self, *, query='', analysis_state=None, usage_state=None, limit=100, offset=0):
+    def list(self, *, query='', analysis_state=None, usage_state=None, limit=100, offset=0, **filters):
         return self.service.library().list(
             query=query, analysis_state=analysis_state, usage_state=usage_state,
-            limit=limit, offset=offset,
+            limit=limit, offset=offset, **filters,
         )
 
     def get(self, resource_id):

@@ -306,12 +306,29 @@ class MaterialLibrary:
             params.extend([-1 if limit is None else limit, offset])
         return sql, params
 
-    def list(self, *, query='', analysis_state=None, usage_state=None, limit=None, offset=0):
-        sql, params = 'SELECT * FROM resources WHERE (source_path LIKE ? OR metadata_json LIKE ? OR id LIKE ?)', ['%'+query+'%']*3
+    def list(self, *, query='', analysis_state=None, usage_state=None, media_type=None, theme=None,
+             subject_group=None, minimum_quality=None, strategy=None, limit=None, offset=0):
+        sql, params = ('SELECT * FROM resources WHERE (source_path LIKE ? OR metadata_json LIKE ? OR id LIKE ? '
+                       'OR analysis_json LIKE ? OR features_json LIKE ? OR manual_subject_group LIKE ?)'), ['%'+query+'%']*6
         for field, value in [('analysis_state', analysis_state), ('usage_state', usage_state)]:
             if value:
                 sql += f' AND {field}=?'
                 params.append(value)
+        if media_type:
+            if media_type not in {'image','video'}: raise ValueError('媒体类型必须为图片或视频')
+            sql += ' AND media_type LIKE ?'; params.append(media_type+'/%')
+        if theme:
+            sql += " AND json_extract(metadata_json,'$.theme')=?"; params.append(theme)
+        if subject_group:
+            sql += ' AND manual_subject_group=?'; params.append(subject_group)
+        if minimum_quality is not None:
+            if isinstance(minimum_quality,bool) or not isinstance(minimum_quality,(int,float)) or not 0<=minimum_quality<=100:
+                raise ValueError('基础质量分必须在 0–100 之间')
+            sql += " AND json_type(features_json,'$.quality') IN ('integer','real') AND json_extract(features_json,'$.quality')>=?"
+            params.append(minimum_quality)
+        if strategy:
+            sql += " AND EXISTS (SELECT 1 FROM json_each(scores_json) s WHERE json_extract(s.value,'$.strategy')=? AND json_extract(s.value,'$.recommendation')='建议使用')"
+            params.append(strategy)
         sql, params = self._pagination(sql + ' ORDER BY created_at DESC,id DESC', params, limit, offset)
         with self.read_db() as db:
             return [dict(r) for r in db.execute(sql, params)]

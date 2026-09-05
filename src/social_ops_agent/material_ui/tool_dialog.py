@@ -10,6 +10,7 @@ from .controls import button, combo, error
 from .task_panel import MaterialTaskPanel
 from .tool_controller import ToolController
 from .selection_dialog import PagedSelectionDialog
+from .discovery_form import DiscoveryForm
 
 
 class MaterialToolDialog(QDialog):
@@ -38,20 +39,8 @@ class MaterialToolDialog(QDialog):
         self.input.setPlaceholderText('每行一个 URL 或本地文件路径')
         self.source = None
         if tool == 'discover':
-            self.platform = combo([('Telegram 公开频道','telegram'),('抖音','douyin'),('小红书','xiaohongshu')])
-            self.source = combo([('频道 / 主页 URL','url'),('关键词','search'),('账号 ID','user'),('首页推荐','timeline')])
-            self.media_type = combo([('图文和视频','both'),('图文','image'),('视频','video')])
-            self.sort = combo([('最新','latest'),('综合','top'),('点赞最多（本次结果）','likes')])
-            self.count, self.days, self.likes, self.views = QSpinBox(), QSpinBox(), QSpinBox(), QSpinBox()
-            self.count.setRange(1,500); self.count.setValue(100)
-            self.days.setRange(0,36500); self.days.setValue(30); self.days.setSpecialValueText('不限时间')
-            for control in (self.likes,self.views):
-                control.setRange(-1,1000000000); control.setValue(-1); control.setSpecialValueText('不限')
-            for title, control in [('平台',self.platform),('来源',self.source),('媒体',self.media_type),('排序',self.sort),('有效条数',self.count),('最近天数',self.days),('点赞大于',self.likes),('播放大于',self.views)]:
-                control.setMinimumHeight(36)
-                self.form.addRow(title,control)
-            self.platform.currentIndexChanged.connect(self.discovery_platform)
-            self.discovery_platform()
+            self.discovery = DiscoveryForm(service,self.input,self)
+            left.addWidget(self.discovery)
         elif tool == 'download':
             self.session = combo([('匿名直接下载', None)] + [(f'{s.platform} · {s.profile_name}',s.session_ref) for s in SessionStore(service.registry_path).list()])
             self.form.addRow('浏览器会话',self.session)
@@ -80,12 +69,6 @@ class MaterialToolDialog(QDialog):
         layout.addWidget(self.tasks, 1)
         if tool in {'import','analyze'}:
             self.source_changed()
-
-    def discovery_platform(self):
-        telegram = self.platform.currentData() == 'telegram'
-        if telegram:
-            self.source.setCurrentIndex(0)
-        self.source.setEnabled(not telegram)
 
     def source_changed(self):
         self.input.clear()
@@ -130,11 +113,7 @@ class MaterialToolDialog(QDialog):
             raw = self.input.toPlainText().strip()
             options = {}
             if self.tool == 'discover':
-                source = self.source.currentData()
-                options = dict(platform=self.platform.currentData(),source=source,media_type=self.media_type.currentData(),
-                    sort=self.sort.currentData(),max_items=self.count.value(),days=self.days.value() or None,
-                    minimum_likes=self.likes.value() if self.likes.value()>=0 else None,
-                    minimum_views=self.views.value() if self.views.value()>=0 else None)
+                options = self.discovery.options()
             elif self.tool == 'download':
                 options['session_ref'] = self.session.currentData()
             else:

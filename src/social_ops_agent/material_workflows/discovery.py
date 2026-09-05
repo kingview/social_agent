@@ -1,4 +1,4 @@
-"""Public discovery workflow; authenticated browser tools remain separate."""
+"""Link discovery; anonymous by default or using an explicitly selected window."""
 
 
 def discover(context, item):
