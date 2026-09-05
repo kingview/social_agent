@@ -15,15 +15,13 @@ from .material_settings import MaterialSettings
 from .material_workflows import HANDLERS, WorkflowContext
 from .material_workflows.inputs import parse_links, sidecar_metadata
 from .plugins import PluginInvoker, PluginManager
+from .material_preparation import MEDIA_SUFFIXES, expand_items
+from .discovery_contract import DiscoveryInput
 from .session_store import default_session_registry_path
 
 TOOLS = {
     'discover': '链接发现', 'download': '资源下载',
     'import': '素材入库', 'analyze': '素材分析',
-}
-MEDIA_SUFFIXES = {
-    '.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.gif',
-    '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v',
 }
 
 # Preserve the existing public import paths used by desktop and MCP callers.
@@ -51,6 +49,7 @@ class MaterialService:
     def create(
         self, tool, items, options=None, *, conversation_id=None,
         trusted_local=False, execution_id=None,
+        check_cancel=None, on_progress=None, before_commit=None,
     ):
         if tool not in TOOLS:
             raise ValueError('未知素材工具')
@@ -60,28 +59,15 @@ class MaterialService:
         options = dict(options or {})
         if options.get('theme') and options['theme'] not in settings.themes:
             raise ValueError('主题必须从全局配置列表选择')
-        expanded = []
-        for item in items:
-            if tool in {'import', 'analyze'} and not str(item).startswith('resource:'):
-                path = Path(item).expanduser().resolve(strict=True)
-                if not trusted_local and not path.is_relative_to(self.output_root):
-                    raise ValueError('Agent 只能使用输出目录中的媒体，其他本地文件请通过工具箱明确选择')
-                candidates = (
-                    sorted(path.rglob('*')) if path.is_dir() and trusted_local else [path]
-                )
-                for candidate in candidates:
-                    resolved = candidate.resolve()
-                    if (
-                        resolved.suffix.lower() in MEDIA_SUFFIXES
-                        and resolved.is_file()
-                        and (not path.is_dir() or resolved.is_relative_to(path))
-                    ):
-                        expanded.append(str(resolved))
-            else:
-                expanded.append(item)
-        expanded = list(dict.fromkeys(expanded))
-        if len(expanded) > 500:
-            raise ValueError('文件超过 500 个，请分批处理')
+        if tool=='discover' and 'platform' in options:
+            # Validate both GUI and Harness input using the same vendored
+            # contract; the plugin independently validates again at its boundary.
+            for item in items:
+                DiscoveryInput.model_validate({**options,'start_url':str(item)})
+        expanded = expand_items(tool,items,self.output_root,trusted_local=trusted_local,
+                                check_cancel=check_cancel,on_progress=on_progress)
+        if before_commit:
+            before_commit()
         return self.jobs.create(
             tool, expanded,
             {'settings': settings.model_dump(mode='json'), 'options': options,

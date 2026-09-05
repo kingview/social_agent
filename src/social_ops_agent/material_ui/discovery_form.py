@@ -1,11 +1,11 @@
 """Phase-one discovery parameters, separate from execution and result views."""
-from datetime import datetime, time, timedelta
 from functools import partial
 from PySide6.QtCore import QDate, Slot
 from PySide6.QtWidgets import QWidget, QFormLayout, QDateEdit, QSpinBox, QDoubleSpinBox, QPushButton, QLabel
 
 from ..diagnostics import record_exception
 from ..material_windows import window_availability
+from ..discovery_contract import DiscoveryInput,DISCOVERY_LIMITS,calendar_bounds,default_source,default_mode
 from .background import BackgroundCall
 from .controls import combo
 
@@ -32,12 +32,12 @@ class DiscoveryForm(QWidget):
         self.end_date = QDateEdit(QDate.currentDate())
         for control in (self.start_date,self.end_date):
             control.setDisplayFormat('yyyy-MM-dd'); control.setCalendarPopup(True); control.setMinimumHeight(40)
-        self.count = QSpinBox(); self.count.setRange(1,500); self.count.setValue(100)
+        self.count = QSpinBox(); self.count.setRange(*DISCOVERY_LIMITS['max_items']); self.count.setValue(DiscoveryInput.model_fields['max_items'].default)
         self.metric_mode = combo([('不限',False),('大于',True)])
         self.metric_value = QSpinBox(); self.metric_value.setRange(-1,2_000_000_000); self.metric_value.setValue(-1)
         self.metric_value.setSpecialValueText('请输入非负整数')
-        self.interval = QDoubleSpinBox(); self.interval.setRange(.3,30); self.interval.setValue(1); self.interval.setSuffix(' 秒')
-        self.timeout = QSpinBox(); self.timeout.setRange(10,3600); self.timeout.setValue(300); self.timeout.setSuffix(' 秒')
+        self.interval = QDoubleSpinBox(); self.interval.setRange(*DISCOVERY_LIMITS['access_interval_seconds']); self.interval.setValue(DiscoveryInput.model_fields['access_interval_seconds'].default); self.interval.setSuffix(' 秒')
+        self.timeout = QSpinBox(); self.timeout.setRange(*DISCOVERY_LIMITS['timeout_seconds']); self.timeout.setValue(DiscoveryInput.model_fields['timeout_seconds'].default); self.timeout.setSuffix(' 秒')
         for title,control in [('平台',self.platform),('获取方式',self.source),('浏览器环境',self.browser),('执行模式',self.mode),
                 ('比特窗口',self.window),('',self.refresh_windows_button),('',self.window_status),('内容类型',self.media_type),
                 ('搜索结果排序',self.sort),('发布时间',self.period),('开始日期',self.start_date),('结束日期',self.end_date),
@@ -71,7 +71,7 @@ class DiscoveryForm(QWidget):
     def platform_changed(self, *_):
         telegram = self.platform.currentData()=='telegram'
         self.source.setEnabled(not telegram)
-        self.source.setCurrentIndex(self.source.findData('url' if telegram else 'timeline'))
+        self.source.setCurrentIndex(self.source.findData(default_source(self.platform.currentData())))
         self.browser.setCurrentIndex(0)
         self.window.clear(); self.window.addItem('请选择一个空闲窗口',None)
         self.input.clear()
@@ -79,7 +79,7 @@ class DiscoveryForm(QWidget):
 
     def browser_changed(self, *_):
         bit = self.browser.currentData()=='bitbrowser'
-        self.mode.setCurrentIndex(self.mode.findData('rpa' if bit else 'automation'))
+        self.mode.setCurrentIndex(self.mode.findData(default_mode(self.browser.currentData())))
         self.update_visibility()
         if bit: self.refresh_windows()
 
@@ -127,9 +127,5 @@ class DiscoveryForm(QWidget):
             options['minimum_views' if telegram else 'minimum_likes']=self.metric_value.value()
         if self.period.currentData()=='custom':
             start,end=self.start_date.date().toPython(),self.end_date.date().toPython()
-            if start>end: raise ValueError('开始日期不能晚于结束日期')
-            # Local calendar dates are converted with the actual offset on each
-            # date, including DST; the end date is inclusive to its final microsecond.
-            options['start_date']=datetime.combine(start,time.min).astimezone().isoformat()
-            options['end_date']=(datetime.combine(end+timedelta(days=1),time.min)-timedelta(microseconds=1)).astimezone().isoformat()
+            options.update(calendar_bounds(start,end))
         return options

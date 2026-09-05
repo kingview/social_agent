@@ -8,17 +8,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
 from threading import Event
-from urllib.parse import urlsplit
 
 from .session_store import SessionStore
 from .browser_queue import BrowserQueueTicket, open_lock
 from .process_locks import _try_lock, _unlock
+from .browser_lock_contract import WORKFLOW_LOCK_DIRECTORY, workflow_key
 
 
 class BrowserWaitCancelled(RuntimeError):
@@ -38,20 +37,14 @@ def resources_for_plan(plan, registry_path: Path) -> list[WindowResource]:
         record = store.get(binding.session_ref)
         if record is None:
             raise ValueError("计划使用的浏览器窗口已被移除，请重新生成任务。")
-        parts = urlsplit(record.api_url)
-        host = (parts.hostname or "").lower()
-        if parts.scheme != "http" or host not in {"localhost", "127.0.0.1", "::1"}:
-            raise ValueError("浏览器调度只允许本机比特浏览器 API。")
-        # Aliases and platform-specific session refs for the SAME profile share one lease.
-        identity = f"loopback:{parts.port or 80}|{record.profile_id}"
-        key = hashlib.sha256(identity.encode()).hexdigest()
+        key = workflow_key(record.api_url,record.profile_id)
         resources[key] = WindowResource(key, record.profile_name or binding.profile_name or "比特浏览器窗口")
     return sorted(resources.values(), key=lambda item: item.key)
 
 
 class BrowserTaskScheduler:
     def __init__(self, root: Path | None = None):
-        self.root = root or Path(tempfile.gettempdir()) / "social-agent-workflow-leases"
+        self.root = root or Path(tempfile.gettempdir()) / WORKFLOW_LOCK_DIRECTORY
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     @contextmanager

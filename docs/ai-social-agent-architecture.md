@@ -1839,5 +1839,9 @@ Next.js
 - 社媒插件提供标准浏览器公开链接发现与公开帖子下载；媒体插件提供 `inspect_material` 检查/修复/复检和扩展分析字段。重依赖仍留在 `.socialtool` 插件中，Agent App 不内置 OpenCV/推理模型。
 - 链接发现统一委派 `material_discovery.py`，标准匿名浏览器为默认，也可显式绑定获授权的比特会话；Telegram 公开采集只走匿名路径。RPA 使用滚轮输入、自动化模式使用页面滚动，均通过 DOM 提取。时间/数量限制、部分结果导出、人工验证等待独立于 UI；不保证平台可访问性或反检测效果。`material_windows.py` 仅后台探测本地 API 和任务占用，不自动打开窗口。
 - `StrategyEditor` 结构化编辑评分规则；素材库和 `list_material_library` 在 SQL 分页前组合媒体/主题/基础分/策略推荐过滤，并检索分析、标签和人工分组。策略重算仍显式触发，不在保存设置时修改历史评分。
+- `material_preparation.py` 独立处理可取消的输入展开；GUI 通过 `BackgroundCall` 调用业务控制器，线程之间仅传递普通数据和 `PreparationControl`。扫描期间不写任务记录，500 项限制在遍历中执行；进入持久任务创建前原子封闭取消阶段，后续取消由任务管理负责。
+- `discovery_contract.py` 是 GUI/服务/插件发现参数的规范来源，`material_dimensions.py` 统一策略可用维度。`browser_lock_contract.py` 固定旧锁键算法及两层锁目录，`browser_occupancy.py` 只做可用性探测；整轮工作流锁与插件操作锁不可合并，否则同一任务内的插件操作会自锁。
+- 共享契约在构建时由 `scripts/sync_shared_contracts.py` 同步到社媒插件，`--check` 与测试检查漂移。独立插件包携带契约，不依赖 Agent 源码目录或 Agent Python 环境。
+- 插件 `material_discovery.py` 保留浏览器生命周期与采集编排；`discovery_runtime.py` 封装时限和人工验证等待，`discovery_state.py` 管理筛选/去重/真实时间排序，`discovery_journal.py` 原子保存单个导出文件及最后检查点。异常路径也保存已有状态；检查点无 Cookie/会话句柄且不构成授权。目前仅用于保留本次数据，跨调用续采还需参数/所有权/会话重验与恢复协议，尚未启用。
 - `TaskCenter` 是 UI 的统一任务查询/控制接口，聚合既有 `TaskStore` 与素材任务记录，保留两者持久化格式与执行边界。列表只读取分页摘要，选中任务按 revision 加载详情；只读查询不保留 SQLite 写锁。
 - Agent 的停止操作定向到所属对话的实际 worker；恢复会开启新一轮 Harness 规划并绑定所选 `resume_turn_id`，保留未发送草稿/附件。发布幂等与原有授权校验不变，不直接重放发布，也不把原任务文本伪装成新授权。素材任务仍用持久命令和逐项检查点；不宣称已经合并调度器，Agent 没有原生暂停时不提供假暂停按钮。完整一期缺口见 `phase1-implementation.md`。

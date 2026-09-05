@@ -19,7 +19,7 @@ class ToolController:
             raise ValueError('链接文件不能超过 5 MB')
         return path.read_text(encoding='utf-8-sig')
 
-    def start(self, raw, options):
+    def start(self, raw, options, *, preparation=None):
         options = dict(options)
         if self.tool == 'discover':
             source = options['source']
@@ -39,8 +39,16 @@ class ToolController:
                 raise ValueError('存在无效或频道级 URL，请改用具体帖子链接：\n'+'\n'.join(rejected[:5]))
         else:
             items = [line.strip() for line in raw.splitlines() if line.strip()]
-        job_id = self.service.create(self.tool, items, options, trusted_local=True)
-        self.runner.submit(job_id)
+        control = {} if preparation is None else dict(check_cancel=preparation.check,
+            on_progress=preparation.progress,before_commit=preparation.seal)
+        job_id = self.service.create(self.tool, items, options, trusted_local=True,**control)
+        try:
+            self.runner.submit(job_id)
+        except Exception as exc:
+            # If the app's runner has shut down during preparation, retain an
+            # explicit retryable failure instead of a queued job with no worker.
+            self.service.jobs.transition(job_id,'执行失败',error=str(exc))
+            raise
         return job_id
 
     def records(self, source, *, query='', limit=100):

@@ -1,8 +1,11 @@
 """MaterialToolDialog presentation widget."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QWidget, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit, QPlainTextEdit, QFileDialog, QMessageBox, QListWidget, QListWidgetItem, QSpinBox, QAbstractItemView, QFrame, QScrollArea
+from functools import partial
+from PySide6.QtCore import QTimer, Slot
+from PySide6.QtWidgets import QWidget, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit, QPlainTextEdit, QFileDialog, QMessageBox, QPushButton, QAbstractSpinBox, QComboBox, QFrame, QScrollArea
+from ..diagnostics import record_exception
+from ..material_preparation import PreparationControl, PreparationCancelled
 from ..material_service import TOOLS
 from ..session_store import SessionStore
 from ..workspace_theme import MATERIAL_STYLE
@@ -11,6 +14,12 @@ from .task_panel import MaterialTaskPanel
 from .tool_controller import ToolController
 from .selection_dialog import PagedSelectionDialog
 from .discovery_form import DiscoveryForm
+from .background import BackgroundCall
+
+
+def report_preparation_error(state_root,exc):
+    if not isinstance(exc,PreparationCancelled):
+        record_exception('agent','materials.prepare',exc,state_root=state_root)
 
 
 class MaterialToolDialog(QDialog):
@@ -26,6 +35,7 @@ class MaterialToolDialog(QDialog):
         form_area.setWidgetResizable(True)
         form_area.setFrameShape(QFrame.Shape.NoFrame)
         form_body = QWidget()
+        self.form_body = form_body
         left = QVBoxLayout(form_body)
         form_area.setWidget(form_body)
         title = QLabel(TOOLS[tool])
@@ -60,12 +70,21 @@ class MaterialToolDialog(QDialog):
         left.addWidget(self.input, 1)
         self.start = button('开始任务',self.start_job,left)
         self.start.setObjectName('primaryButton')
+        self.cancel_prepare = button('取消准备',self.cancel_preparation,left)
+        self.cancel_prepare.hide()
         self.notice = QLabel('关闭此窗口可隐藏任务；文件检查点和结果会保留。')
         self.notice.setWordWrap(True)
         left.addWidget(self.notice)
         layout.addWidget(form_area, 1)
         self.tasks = MaterialTaskPanel(service,runner,self,tool=tool,task_center=task_center)
         self.controller = ToolController(service,runner,tool,self.tasks.task_center)
+        self.preparation = None
+        self.prepare_call = BackgroundCall(self,error_reporter=partial(report_preparation_error,service.state_root))
+        self.prepare_call.succeeded.connect(self.prepared)
+        self.prepare_call.failed.connect(self.preparation_failed)
+        self.prepare_timer = QTimer(self)
+        self.prepare_timer.setInterval(150)
+        self.prepare_timer.timeout.connect(self.preparation_progress)
         layout.addWidget(self.tasks, 1)
         if tool in {'import','analyze'}:
             self.source_changed()
@@ -109,6 +128,8 @@ class MaterialToolDialog(QDialog):
             self.input.setPlainText('\n'.join(dialog.values()))
 
     def start_job(self):
+        if self.prepare_call.busy:
+            return
         try:
             raw = self.input.toPlainText().strip()
             options = {}
@@ -118,13 +139,59 @@ class MaterialToolDialog(QDialog):
                 options['session_ref'] = self.session.currentData()
             else:
                 if self.tool == 'import': options['theme'] = self.theme.currentData()
-            job_id = self.controller.start(raw,options)
-            self.tasks.refresh()
-            self.notice.setText('任务已创建：' + job_id[:8] + '。配置已快照保存，修改表单只影响下一任务。')
+            preparation = PreparationControl()
+            operation = partial(self.controller.start,raw,options,preparation=preparation)
+            self.preparation = preparation
+            self._preparing_controls = [(control,control.isEnabled()) for control in self.form_body.findChildren(QWidget)
+                if isinstance(control,(QPushButton,QComboBox,QLineEdit,QPlainTextEdit,QAbstractSpinBox)) and control is not self.cancel_prepare]
+            for control,_ in self._preparing_controls: control.setEnabled(False)
+            self.cancel_prepare.setEnabled(True); self.cancel_prepare.show()
+            self.notice.setText('正在后台检查输入，准备创建任务…')
+            self.start.setText('准备中…')
+            # Only thread-safe control data is captured, not the view itself.
+            self._cancel_on_destroy = lambda *_:preparation.cancel()
+            self.destroyed.connect(self._cancel_on_destroy)
+            self.prepare_call.start(operation)
+            self.prepare_timer.start()
         except Exception as exc:
             error(self,exc)
 
+    def preparation_progress(self):
+        if self.preparation and self.cancel_prepare.isEnabled():
+            self.notice.setText(f'正在后台准备，已找到 {self.preparation.count} 个有效输入…')
+
+    def cancel_preparation(self):
+        if self.preparation:
+            cancelled = self.preparation.cancel()
+            self.cancel_prepare.setEnabled(False)
+            self.notice.setText('正在取消准备…' if cancelled else '已进入创建阶段；创建后可从任务管理停止。')
+
+    def finish_preparation(self):
+        self.prepare_timer.stop()
+        self.destroyed.disconnect(self._cancel_on_destroy)
+        self.cancel_prepare.hide()
+        self.start.setText('开始任务')
+        for control,enabled in self._preparing_controls: control.setEnabled(enabled)
+        self.preparation = None
+
+    @Slot(object)
+    def prepared(self,job_id):
+        self.finish_preparation()
+        self.tasks.refresh()
+        self.notice.setText('任务已创建：' + job_id[:8] + '。配置已快照保存，修改表单只影响下一任务。')
+
+    @Slot(object)
+    def preparation_failed(self,exc):
+        self.finish_preparation()
+        self.notice.setText(str(exc) if isinstance(exc,PreparationCancelled) else '任务创建失败，详情已写入日志。')
+        if self.isVisible() and not isinstance(exc,PreparationCancelled):
+            QMessageBox.warning(self,'任务未创建',str(exc))
+
     def closeEvent(self,event):
+        if self.prepare_call.busy:
+            self.cancel_preparation()
+            event.accept()
+            return
         try:
             running = self.controller.active_tasks()
         except Exception as exc:

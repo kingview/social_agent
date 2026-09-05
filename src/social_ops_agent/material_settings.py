@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .state_io import write_json
+from .material_dimensions import SCORE_DIMENSIONS,FILTER_DIMENSIONS
 
 
 class StrategyRule(BaseModel):
@@ -19,15 +20,14 @@ class StrategyRule(BaseModel):
     @field_validator('required', 'preferred')
     @classmethod
     def valid_dimensions(cls, value):
-        if set(value)-{'topic','language','format','audience','style','timeliness','portrait'}:
+        if set(value)-FILTER_DIMENSIONS:
             raise ValueError('筛选或偏好维度不受支持')
         return value
 
     @field_validator('weights')
     @classmethod
     def valid_weights(cls, value):
-        allowed = {'quality', 'topic', 'language', 'format', 'audience', 'style', 'timeliness', 'portrait'}
-        if not value or set(value) - allowed or any(not 0 <= v <= 100 for v in value.values()) or not sum(value.values()):
+        if not value or set(value) - SCORE_DIMENSIONS or any(not 0 <= v <= 100 for v in value.values()) or not sum(value.values()):
             raise ValueError('评分权重必须是受支持维度的非负数，且总和大于 0')
         return value
 
